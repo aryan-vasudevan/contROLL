@@ -155,7 +155,17 @@ else:
 # --- enumeration -----------------------------------------------------------
 section("USB device")
 
+CABLE_ADVICE = (
+    "Check the cable. It must be a data cable; charge-only cables are the "
+    "single most common cause.\n"
+    "Try a different port. On a Pi 5 prefer the blue USB3 ones.\n"
+    "If the camera is warm but invisible, suspect power, below."
+)
+
+bus_checked = False
+
 if shutil.which("lsusb"):
+    bus_checked = True
     lsusb = run(["lsusb"])
     movidius = [ln for ln in lsusb.splitlines() if "03e7" in ln.lower()]
     if movidius:
@@ -166,12 +176,27 @@ if shutil.which("lsusb"):
                    "Normal before first use. DepthAI uploads firmware on connect.")
     else:
         report(FAIL, "No Movidius device on the USB bus",
-               "Nothing with vendor id 03e7 is attached.",
-               "Check the cable. It must be a data cable, not charge-only.\n"
-               "Try the other USB3 port, the blue ones.\n"
-               "If the camera is warm but invisible, suspect power, below.")
+               "Nothing with vendor id 03e7 is attached.", CABLE_ADVICE)
+
+elif sys.platform == "darwin" and shutil.which("ioreg"):
+    # macOS has no lsusb. ioreg reports ids in decimal, so the Movidius
+    # vendor id 0x03e7 appears as 999.
+    bus_checked = True
+    usb = run(["ioreg", "-p", "IOUSB", "-l", "-w0"])
+    if not usb.strip() or "idVendor" not in usb:
+        report(FAIL, "No USB devices attached at all",
+               "The USB tree contains only the host controllers.", CABLE_ADVICE)
+    elif '"idVendor" = 999' in usb:
+        report(OK, "Camera visible on the USB bus", "Movidius, vendor id 0x03e7")
+        if '"idProduct" = 9349' in usb:      # 0x2485, the unbooted ROM
+            report(INFO, "Device is in bootloader state",
+                   "Normal before first use. DepthAI uploads firmware on connect.")
+    else:
+        report(FAIL, "No Movidius device on the USB bus",
+               "USB devices are attached, but none with vendor id 0x03e7.",
+               CABLE_ADVICE)
 else:
-    report(INFO, "lsusb not available, skipping bus scan")
+    report(INFO, "No USB enumeration tool available, skipping bus scan")
 
 # --- power -----------------------------------------------------------------
 section("Power budget")
@@ -237,9 +262,15 @@ else:
         report(WARN, "Device enumeration raised", str(exc))
 
     if not devices:
-        report(FAIL, "DepthAI cannot see a camera",
-               "The bus check above tells you whether this is a cable problem "
-               "or a permissions problem.")
+        detail = ("The bus check above tells you which of the two this is: if "
+                  "the bus sees it, this is permissions; if not, it is the "
+                  "cable or the power."
+                  if bus_checked else
+                  "No bus scan ran, so this could be the cable, the power or "
+                  "permissions.")
+        report(FAIL, "DepthAI cannot see a camera", detail,
+               "Plug the OAK-1 in with a data-capable USB cable and run this "
+               "again.")
     else:
         report(OK, f"{len(devices)} device(s) found",
                "\n".join(str(d.getDeviceId()) for d in devices))
