@@ -19,8 +19,26 @@
 //                         192.168.2.1
 //
 // Wi-Fi names are case sensitive, so "ardupilot" will not find "ArduPilot".
-#define WIFI_SSID        "f450-badge"
-#define WIFI_PASS        "change-me-please"
+//
+// REAL CREDENTIALS DO NOT GO IN THIS FILE -- it is tracked by git, and a
+// password committed once stays in the history even after it is deleted.
+// Put them in include/secrets.h, which is gitignored:
+//
+//     #define WIFI_SSID "my-network"
+//     #define WIFI_PASS "my-password"
+//     #define PI_IP     "192.168.4.5"
+//
+// The placeholders below apply only when that file is absent.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
+#ifndef WIFI_SSID
+  #define WIFI_SSID      "f450-badge"
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS      "change-me-please"
+#endif
 
 // UDP endpoints. DRONE_IP is where we send before anything has been heard back.
 // Leave AUTO_DISCOVER_PEER on and the badge re-targets whatever address MAVLink
@@ -40,7 +58,10 @@
 // the access point on 192.168.4.1 either way. The port is deliberately NOT
 // 14550: that one belongs to MAVLink, and keeping them apart means you can run
 // both on the Pi at once without them eating each other's packets.
-#define PI_IP             DRONE_IP
+                                        // set back to DRONE_IP for the Pi AP
+#ifndef PI_IP
+  #define PI_IP           DRONE_IP
+#endif
 #define PI_UDP_PORT       14555   // where the Pi listens for button state
 #define PI_UDP_LOCAL_PORT 14556   // where the badge listens for the reply
 

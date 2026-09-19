@@ -67,6 +67,22 @@ constexpr uint32_t kAckTimeoutMs = 2000;
 // strapping pin -- so the window has to live here instead.
 constexpr uint32_t kModeWindowMs = 5000;
 
+bool gScanned = false;   // the one-shot diagnostic scan below
+
+// Arduino's WiFi status codes, spelled out. Worth having by name: 1 and 4
+// look the same from outside and mean completely different things.
+const char *wifiStatusName(int s) {
+  switch (s) {
+    case WL_IDLE_STATUS:     return "idle";
+    case WL_NO_SSID_AVAIL:   return "SSID not seen on the air";
+    case WL_CONNECTED:       return "connected";
+    case WL_CONNECT_FAILED:  return "rejected, usually a wrong password";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED:    return "disconnected, still trying";
+    default:                 return "unknown";
+  }
+}
+
 // Reported in a fixed order so the Pi side can rely on it. BOOT is excluded:
 // it is the mode strap, not a game button.
 const btn::Id kReported[] = {btn::UP, btn::DOWN, btn::LEFT, btn::RIGHT,
@@ -190,7 +206,37 @@ void loop() {
     leds::poll();
     if (millis() - gLastLogMs >= 2000) {
       gLastLogMs = millis();
-      Serial.printf("[pilink] waiting for \"%s\"\n", WIFI_SSID);
+      // The status code separates the two failures that look identical from
+      // the outside: 1 means the SSID was never seen on the air, 4 usually
+      // means it was seen and the password was rejected.
+      Serial.printf("[pilink] waiting for \"%s\"  status=%d (%s)\n",
+                    WIFI_SSID, (int)WiFi.status(), wifiStatusName(WiFi.status()));
+    }
+    // One scan, once, after giving the normal path a fair chance. Says whether
+    // the network is even on the air and what the badge's radio can actually
+    // see, which is the question you otherwise end up guessing at.
+    if (!gScanned && millis() > 12000) {
+      gScanned = true;
+      Serial.println("[pilink] scanning for visible 2.4 GHz networks...");
+      // A scan started while a connect attempt is still running comes back
+      // empty on the ESP32, which reads as "the radio is dead" when it only
+      // means "the radio was busy". Stop trying first, then scan.
+      WiFi.disconnect(false, false);
+      delay(300);
+      const int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+      if (n <= 0) {
+        Serial.println("[pilink]   nothing visible at all");
+      } else {
+        for (int i = 0; i < n; i++) {
+          const bool match = WiFi.SSID(i) == String(WIFI_SSID);
+          Serial.printf("[pilink]   %-34s rssi %4d  %s%s\n",
+                        WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                        WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "encrypted",
+                        match ? "   <-- this is the one we want" : "");
+        }
+      }
+      WiFi.scanDelete();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);   // scanning drops the attempt; restart it
     }
     return;
   }
