@@ -21,9 +21,30 @@ WITH_GUI=0
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m    warning: %s\033[0m\n' "$*"; }
 die()  { printf '\033[31m    error: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Refuse early on a machine this cannot work on, rather than failing several
+# steps later inside apt-get.
+if [[ "$(uname -s)" != "Linux" ]]; then
+  die "this runs on the Raspberry Pi, not on $(uname -s).
+
+     It installs Linux packages and a udev rule. Neither exists here.
+
+     Copy this folder to the Pi and run it there:
+         scp -r $HERE <user>@<pi>:~/
+         ssh <user>@<pi>
+         cd pi5 && ./setup.sh
+
+     To try the DepthAI API on this machine without a Pi, you only need:
+         python3 -m venv ~/oakenv && ~/oakenv/bin/pip install depthai opencv-python
+         ~/oakenv/bin/python check.py"
+fi
+
+command -v apt-get >/dev/null 2>&1 || die "\`apt-get\` not found.
+     This expects Raspberry Pi OS or another Debian. Run it on the Pi."
 
 [[ $EUID -ne 0 ]] || die "run this as your normal user, not with sudo.
      It will ask for sudo only for the udev rule."

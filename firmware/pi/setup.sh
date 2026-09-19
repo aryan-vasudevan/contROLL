@@ -44,11 +44,32 @@ warn() { printf '\033[33m    warning: %s\033[0m\n' "$*"; }
 die()  { printf '\033[31m    error: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- preflight --------------------------------------------------------------
-[[ $EUID -eq 0 ]] || die "run this with sudo"
+
+# Refuse early and clearly on a machine this cannot possibly work on, rather
+# than warning and then failing several steps later inside apt-get.
+if [[ "$(uname -s)" != "Linux" ]]; then
+  die "this runs on the Raspberry Pi, not on $(uname -s).
+
+     It installs Linux packages, writes /etc/mavlink-router/main.conf and
+     reconfigures Wi-Fi through NetworkManager. None of that exists here.
+
+     Copy this folder to the Pi and run it there:
+         scp -r $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) <user>@<pi>:~/
+         ssh <user>@<pi>
+         cd pi && sudo AP_PASS='choose-something' ./setup.sh"
+fi
+
+for tool in apt-get nmcli; do
+  command -v "$tool" >/dev/null 2>&1 || die "\`$tool\` not found.
+     This expects Raspberry Pi OS Bookworm or another Debian with
+     NetworkManager. Run it on the Pi."
+done
 
 if ! grep -qi 'raspberry pi' /proc/device-tree/model 2>/dev/null; then
-  warn "this does not look like a Raspberry Pi; continuing anyway"
+  warn "not a Raspberry Pi, but the tooling is here; continuing anyway"
 fi
+
+[[ $EUID -eq 0 ]] || die "run this with sudo"
 
 if [[ -z "$AP_PASS" ]]; then
   die "set an access point password, for example:

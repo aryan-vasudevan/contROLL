@@ -73,6 +73,17 @@ MODES = {0: 'STABILIZE', 2: 'ALT_HOLD', 3: 'AUTO', 4: 'GUIDED', 5: 'LOITER',
          6: 'RTL', 9: 'LAND', 16: 'POSHOLD'}
 FIX = {0: 'none', 1: 'none', 2: '2D', 3: '3D', 4: 'DGPS', 5: 'RTK-float', 6: 'RTK-fixed'}
 
+def die(problem, *fixes):
+    """Explain the problem and stop. No stack trace: this is a tool for
+    working out what is wrong, so a traceback is the least useful thing it
+    could print."""
+    print(f"\n  {problem}\n", file=sys.stderr)
+    for line in fixes:
+        print(f"  {line}" if line else "", file=sys.stderr)
+    print(file=sys.stderr)
+    raise SystemExit(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--host', default='127.0.0.1')
@@ -86,29 +97,69 @@ def main():
         try:
             import serial
         except ImportError:
-            sys.exit("pyserial is needed for --serial: sudo apt install python3-serial")
-        port = serial.Serial(args.serial, args.baud, timeout=1)
+            die("pyserial is needed for --serial",
+                "sudo apt install python3-serial")
+        try:
+            port = serial.Serial(args.serial, args.baud, timeout=1)
+        except Exception as exc:
+            die(f"cannot open {args.serial}: {exc}",
+                "Check the port exists:  ls /dev/tty*",
+                "On a Pi 5 the GPIO header UART is /dev/ttyAMA0.",
+                "/dev/serial0 is the separate debug connector, not the header.",
+                "If it says permission denied:  sudo usermod -aG dialout $USER",
+                "then log out and back in.")
         src = lambda: port.read(512)
-        where = f'{args.serial} at {args.baud}'
+        where = f"{args.serial} at {args.baud}"
+
     elif args.udp:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(('0.0.0.0', 14550))
+        try:
+            s.bind(("0.0.0.0", 14550))
+        except OSError as exc:
+            die(f"cannot bind UDP 14550: {exc}",
+                "Something else already has that port. Usually mavlink-router.",
+                "Either stop it, or use the default TCP mode instead of --udp.")
         s.settimeout(1.0)
+
         def src():
             try:
                 return s.recv(2048)
             except socket.timeout:
-                return b''
-        where = 'UDP 14550'
+                return b""
+
+        where = "UDP 14550"
+
     else:
-        s = socket.create_connection((args.host, args.port), timeout=5)
+        try:
+            s = socket.create_connection((args.host, args.port), timeout=5)
+        except ConnectionRefusedError:
+            die(f"nothing is listening on {args.host}:{args.port}",
+                "This mode reads mavlink-router's TCP server, so the router "
+                "has to be running:",
+                "    sudo systemctl start mavlink-router",
+                "    systemctl status mavlink-router",
+                "",
+                "Run this ON THE PI, not on your laptop. Nothing on a laptop "
+                "serves this port.",
+                "",
+                "To read the flight controller's serial port directly and skip "
+                "the router entirely:",
+                f"    python3 listen.py --serial /dev/ttyAMA0 --baud {args.baud}")
+        except socket.timeout:
+            die(f"timed out connecting to {args.host}:{args.port}",
+                "The address answered nothing. Check you are on the same "
+                "network as the Pi and that the address is right.")
+        except OSError as exc:
+            die(f"cannot reach {args.host}:{args.port}: {exc}")
         s.settimeout(1.0)
+
         def src():
             try:
                 return s.recv(2048)
             except socket.timeout:
-                return b''
-        where = f'TCP {args.host}:{args.port}'
+                return b""
+
+        where = f"TCP {args.host}:{args.port}"
 
     print(f'listening on {where}; ctrl-c to stop\n')
 
