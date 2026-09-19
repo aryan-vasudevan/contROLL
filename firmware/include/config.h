@@ -70,7 +70,17 @@
 // a firmware crash and is not one. WIFI_POWER_11dBm still leaves tens of dB
 // of margin against a Pi in the same room. Raise it if the link gets flaky at
 // distance, and expect to pay for it in battery life.
-#define WIFI_TX_POWER     WIFI_POWER_19_5dBm
+// Confirmed on hardware: the badge associates fine on USB and cannot associate
+// at all on two AA cells. Association needs sustained full-power transmit, and
+// the MT3608 boost cannot deliver those current spikes from tired cells -- the
+// chip browns out before the handshake finishes. Transmit power is the largest
+// lever on peak current, and against a Pi measured at -50 dBm in the same room
+// there are tens of dB to give away.
+//
+// Raise it only if the link gets flaky at distance, and expect to pay for it in
+// battery life. Options, in descending draw: WIFI_POWER_19_5dBm, _17dBm,
+// _15dBm, _13dBm, _11dBm, _8_5dBm, _7dBm, _5dBm, _2dBm.
+#define WIFI_TX_POWER     WIFI_POWER_11dBm
 
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
