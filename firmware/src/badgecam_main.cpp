@@ -64,10 +64,18 @@ constexpr uint32_t kStallMs      = 4000;
 
 uint8_t  gFrame[kMaxFrame];
 
-// One decoded MCU block, expanded. JPEGDEC blocks are at most 16x16, so at the
-// largest scale we support this is 64x64 pixels.
-constexpr int kMaxScale = 4;
-uint16_t gScaled[16 * kMaxScale * 16 * kMaxScale];
+// One decoded strip, expanded.
+//
+// JPEGDEC does NOT hand back 16x16 blocks. It hands back a strip up to the
+// full width of the image and up to one MCU tall, so for a 160 wide source
+// that is 160x16, and 320x32 once doubled. Sizing this for 16x16 overran it
+// and corrupted the stack, which showed up as a panic with a garbage PC.
+//
+// The scale is always chosen so the result fits the panel, so the widest
+// possible strip is the panel width, and the tallest is one MCU scaled up.
+constexpr int kMaxScale   = 4;
+constexpr int kMaxStripPx = 320 * (16 * kMaxScale);
+uint16_t gScaled[kMaxStripPx];
 int      gScale   = 1;          // worked out per frame from the image size
 int      gOffsetX = 0, gOffsetY = 0;
 uint32_t gLastFrameMs = 0;
@@ -95,6 +103,15 @@ int onJpegBlock(JPEGDRAW *block) {
   // is softer; that is the trade being made deliberately.
   const int sw = block->iWidth, sh = block->iHeight;
   const int dw = sw * gScale;
+
+  // Never trust the decoder's block geometry against a fixed buffer. Drawing
+  // one strip unscaled is a visible glitch; running off the end of this array
+  // is a reboot.
+  if ((size_t)dw * sh * gScale > kMaxStripPx) {
+    gTft.drawRGBBitmap(block->x + gOffsetX, block->y + gOffsetY,
+                       block->pPixels, sw, sh);
+    return 1;
+  }
   for (int y = 0; y < sh; y++) {
     uint16_t *dst = gScaled + (size_t)y * gScale * dw;
     const uint16_t *src = block->pPixels + (size_t)y * sw;
