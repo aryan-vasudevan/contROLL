@@ -70,6 +70,7 @@ constexpr uint32_t kModeWindowMs = 5000;
 
 bool     gScanned = false;   // the one-shot diagnostic scan below
 uint32_t gLastConnectMs = 0;
+uint16_t gConnectAttempts = 0;
 
 // The badge is usually powered before the Pi has finished booting, so the
 // access point appears after the first connect attempt has already failed.
@@ -77,6 +78,16 @@ uint32_t gLastConnectMs = 0;
 // SSID a fresh scan can plainly see, so the attempt has to be restarted
 // rather than waited on.
 constexpr uint32_t kReconnectMs = 8000;
+
+// Escalating recovery. Re-running WiFi.begin() against an access point holding
+// stale state for our MAC fails the same way forever, so retrying alone is not
+// enough: every fourth attempt tears the radio down completely, which drops any
+// cached BSSID and channel, and if even that has not worked after about two
+// minutes the whole chip restarts. A badge that reboots itself once is a far
+// better outcome than a badge that sits there blue while someone wonders
+// whether to power-cycle it.
+constexpr uint16_t kHardResetEvery   = 4;
+constexpr uint16_t kRebootAfter      = 15;   // x kReconnectMs = about 2 minutes
 
 // Why the chip last restarted. Printed at boot because a badge that vanishes
 // mid-session looks identical whether it browned out, panicked or was simply
@@ -94,6 +105,35 @@ const char *resetReasonName(esp_reset_reason_t r) {
     case ESP_RST_BROWNOUT: return "BROWNOUT -- the supply sagged, replace the batteries";
     case ESP_RST_DEEPSLEEP:return "woke from deep sleep";
     default:               return "unknown";
+  }
+}
+
+// The 802.11 reason code the access point (or our own stack) gave for the last
+// disconnect. WL_CONNECT_FAILED lumps a wrong password together with a
+// handshake that timed out and a cipher the AP refused, and those are three
+// different problems. This is the number that actually distinguishes them.
+const char *disconnectReasonName(uint8_t r) {
+  switch (r) {
+    case 2:   return "AUTH_EXPIRE";
+    case 4:   return "ASSOC_EXPIRE";
+    case 5:   return "ASSOC_TOOMANY -- the AP is full";
+    case 6:   return "NOT_AUTHED";
+    case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE";
+    case 14:  return "MIC_FAILURE -- wrong password";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT -- wrong password, or we are not being heard";
+    case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+    case 18:  return "GROUP_CIPHER_INVALID";
+    case 19:  return "PAIRWISE_CIPHER_INVALID";
+    case 20:  return "AKMP_INVALID";
+    case 24:  return "CIPHER_SUITE_REJECTED";
+    case 200: return "BEACON_TIMEOUT -- we drifted out of range";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default:  return "see esp_wifi_types.h";
   }
 }
 
@@ -196,7 +236,13 @@ void setup() {
                  "(console only, radio off)");
 
   Serial.printf("[pilink] joining \"%s\"\n", WIFI_SSID);
+  WiFi.persistent(false);   // never reuse a previous boot's stored AP config
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    const uint8_t r = info.wifi_sta_disconnected.reason;
+    Serial.printf("[pilink] disconnected, reason %u (%s)\n", r, disconnectReasonName(r));
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   // Recent ESP32 cores refuse anything below WPA2 and report the AP as simply
   // absent -- WL_NO_SSID_AVAIL for a network a scan can plainly see, which is
   // a maddening thing to debug. NetworkManager's key-mgmt=wpa-psk with no
@@ -257,8 +303,29 @@ void loop() {
 
     if (millis() - gLastConnectMs >= kReconnectMs) {
       gLastConnectMs = millis();
-      WiFi.disconnect();
+      gConnectAttempts++;
+
+      if (gConnectAttempts >= kRebootAfter) {
+        Serial.println("[pilink] still not on the network; restarting the badge");
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+      }
+
+      if (gConnectAttempts % kHardResetEvery == 0) {
+        Serial.printf("[pilink] attempt %u: tearing the radio down and back up\n",
+                      gConnectAttempts);
+        WiFi.disconnect(true, true);   // also erase the stored AP config
+        WiFi.mode(WIFI_OFF);
+        delay(300);
+        WiFi.mode(WIFI_STA);
+        WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+      } else {
+        WiFi.disconnect();
+      }
+
       WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.setTxPower(WIFI_TX_POWER);
     }
     // One scan, once, after giving the normal path a fair chance. Says whether
     // the network is even on the air and what the badge's radio can actually
@@ -290,6 +357,7 @@ void loop() {
     return;
   }
 
+  gConnectAttempts = 0;
   pollAck();
 
   const uint32_t now    = millis();

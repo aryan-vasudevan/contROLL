@@ -70,7 +70,7 @@
 // a firmware crash and is not one. WIFI_POWER_11dBm still leaves tens of dB
 // of margin against a Pi in the same room. Raise it if the link gets flaky at
 // distance, and expect to pay for it in battery life.
-#define WIFI_TX_POWER     WIFI_POWER_11dBm
+#define WIFI_TX_POWER     WIFI_POWER_19_5dBm
 
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
