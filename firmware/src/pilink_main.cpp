@@ -67,7 +67,15 @@ constexpr uint32_t kAckTimeoutMs = 2000;
 // strapping pin -- so the window has to live here instead.
 constexpr uint32_t kModeWindowMs = 5000;
 
-bool gScanned = false;   // the one-shot diagnostic scan below
+bool     gScanned = false;   // the one-shot diagnostic scan below
+uint32_t gLastConnectMs = 0;
+
+// The badge is usually powered before the Pi has finished booting, so the
+// access point appears after the first connect attempt has already failed.
+// The ESP32 latches that failure and keeps reporting WL_NO_SSID_AVAIL for an
+// SSID a fresh scan can plainly see, so the attempt has to be restarted
+// rather than waited on.
+constexpr uint32_t kReconnectMs = 8000;
 
 // Arduino's WiFi status codes, spelled out. Worth having by name: 1 and 4
 // look the same from outside and mean completely different things.
@@ -166,6 +174,12 @@ void setup() {
 
   Serial.printf("[pilink] joining \"%s\"\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  // Recent ESP32 cores refuse anything below WPA2 and report the AP as simply
+  // absent -- WL_NO_SSID_AVAIL for a network a scan can plainly see, which is
+  // a maddening thing to debug. NetworkManager's key-mgmt=wpa-psk with no
+  // explicit proto brings an access point up as original WPA, so accept it.
+  // The Pi side should be pinned to RSN/CCMP; this is the belt to that braces.
+  WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   leds::setStatus(leds::Status::WifiConnecting);
 
@@ -212,6 +226,12 @@ void loop() {
       Serial.printf("[pilink] waiting for \"%s\"  status=%d (%s)\n",
                     WIFI_SSID, (int)WiFi.status(), wifiStatusName(WiFi.status()));
     }
+
+    if (millis() - gLastConnectMs >= kReconnectMs) {
+      gLastConnectMs = millis();
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
     // One scan, once, after giving the normal path a fair chance. Says whether
     // the network is even on the air and what the badge's radio can actually
     // see, which is the question you otherwise end up guessing at.
@@ -229,14 +249,15 @@ void loop() {
       } else {
         for (int i = 0; i < n; i++) {
           const bool match = WiFi.SSID(i) == String(WIFI_SSID);
-          Serial.printf("[pilink]   %-34s rssi %4d  %s%s\n",
-                        WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+          Serial.printf("[pilink]   %-34s ch %2d  rssi %4d  auth %d %s%s\n",
+                        WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i),
+                        (int)WiFi.encryptionType(i),
                         WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "encrypted",
                         match ? "   <-- this is the one we want" : "");
         }
       }
       WiFi.scanDelete();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);   // scanning drops the attempt; restart it
+      gLastConnectMs = 0;   // scanning drops the attempt; let the retry restart it
     }
     return;
   }
