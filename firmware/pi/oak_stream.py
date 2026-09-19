@@ -34,6 +34,7 @@ Useful without a badge:
 """
 
 import argparse
+import os
 import socket
 import struct
 import sys
@@ -44,6 +45,7 @@ MAGIC = b"BJPF"
 # losing the whole frame if any one fragment goes missing, and some of those
 # fragments would be lost on exactly the weak link this is meant to survive.
 CHUNK = 1400
+DET_MAGIC = b"BDET"
 DEFAULT_PORT = 14557          # 14555/14556 belong to the button link
 
 
@@ -119,6 +121,17 @@ def serve(dai, args):
     print(f"  {args.width}x{args.height} @ {args.fps} fps, MJPEG quality {args.quality}")
     print("  waiting for the badge; ctrl-c to stop")
 
+    detector = None
+    if args.detect:
+        import detect as detect_mod
+        detector = detect_mod.from_env(interval=args.detect_interval)
+        if detector is None:
+            print("  detection asked for but RF_API_KEY is not set; skipping")
+        else:
+            detector.start()
+            print(f"  detection on, every {args.detect_interval}s, "
+                  f"out of band from the video")
+
     frame_id = 0
     frames = dropped = total_bytes = 0
     last_report = time.monotonic()
@@ -162,6 +175,20 @@ def serve(dai, args):
                 frames += 1
                 total_bytes += len(jpeg)
 
+                if detector is not None:
+                    # Hand the detector the frame we just sent, and ship
+                    # whatever boxes it last produced. Boxes are tiny next to a
+                    # frame, so this costs nothing measurable.
+                    detector.offer(jpeg)
+                    boxes = detector.boxes()
+                    if boxes:
+                        blob = DET_MAGIC + struct.pack("<BH", len(boxes), frame_id)
+                        for x, y, w, h, label, conf in boxes[:16]:
+                            name = label.encode()[:15]
+                            blob += struct.pack("<hhHHBB", x, y, w, h,
+                                                int(conf * 100), len(name)) + name
+                        sock.sendto(blob, peer)
+
                 now = time.monotonic()
                 if now - last_report >= 5.0:
                     span = now - last_report
@@ -192,6 +219,14 @@ def main():
     ap.add_argument("--quality", type=int, default=70, help="MJPEG quality, 1-100")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--detect", action="store_true",
+                    help="run the Roboflow workflow alongside the stream and send "
+                         "boxes to the badge. Needs RF_API_KEY in the environment "
+                         "and internet on this machine.")
+    ap.add_argument("--detect-interval", type=float, default=0.5,
+                    help="seconds between inference calls (default 0.5). A round "
+                         "trip is about half a second, so going below this just "
+                         "queues up.")
     ap.add_argument("--list", action="store_true", help="list attached OAK devices and exit")
     ap.add_argument("--save", type=int, metavar="N",
                     help="write N frames to .jpg files and exit; no badge needed")

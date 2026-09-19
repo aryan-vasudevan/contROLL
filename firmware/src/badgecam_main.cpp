@@ -61,6 +61,7 @@ constexpr size_t   kMaxFrame     = 48 * 1024;
 constexpr uint16_t kStreamPort   = 14557;
 constexpr uint16_t kVideoLocalPort = 14558;
 constexpr size_t   kChunk        = 1400;
+constexpr int      kMaxBoxes     = 16;
 constexpr uint32_t kReconnectMs  = 3000;
 constexpr uint32_t kStallMs      = 4000;
 
@@ -182,6 +183,16 @@ uint32_t gAsmMask    = 0;      // bit per chunk received; 32 chunks is 44 KB
 size_t   gAsmLen     = 0;
 bool     gAsmActive  = false;
 
+// Detections, drawn over the video. They arrive out of band and much more
+// slowly than frames -- inference is a network round trip -- so they are held
+// and redrawn on every frame until replaced or they go stale. Boxes that no
+// longer match what the camera sees are worse than no boxes.
+struct Box { int16_t x, y; uint16_t w, h; uint8_t conf; char label[16]; };
+Box      gBoxes[kMaxBoxes];
+int      gBoxCount   = 0;
+uint32_t gBoxesAtMs  = 0;
+constexpr uint32_t kBoxStaleMs = 2000;
+
 void requestFrame() {
   gVideo.beginPacket(gPeer, kStreamPort);
   gVideo.write((const uint8_t *)"R", 1);
@@ -196,6 +207,30 @@ bool pumpVideo() {
 
   while ((size = gVideo.parsePacket()) > 0) {
     const int n = gVideo.read(pkt, sizeof(pkt));
+    if (n >= 7 && memcmp(pkt, "BDET", 4) == 0) {
+      int count = pkt[4];
+      if (count > kMaxBoxes) count = kMaxBoxes;
+      int off = 7, parsed = 0;
+      while (parsed < count && off + 10 <= n) {
+        Box &b = gBoxes[parsed];
+        b.x = (int16_t)((uint16_t)pkt[off] | ((uint16_t)pkt[off + 1] << 8));
+        b.y = (int16_t)((uint16_t)pkt[off + 2] | ((uint16_t)pkt[off + 3] << 8));
+        b.w = (uint16_t)pkt[off + 4] | ((uint16_t)pkt[off + 5] << 8);
+        b.h = (uint16_t)pkt[off + 6] | ((uint16_t)pkt[off + 7] << 8);
+        b.conf = pkt[off + 8];
+        const int len = pkt[off + 9];
+        off += 10;
+        if (len < 0 || off + len > n) break;
+        const int copy = min(len, (int)sizeof(b.label) - 1);
+        memcpy(b.label, pkt + off, copy);
+        b.label[copy] = 0;
+        off += len;
+        parsed++;
+      }
+      gBoxCount  = parsed;
+      gBoxesAtMs = millis();
+      continue;
+    }
     if (n < 10 || memcmp(pkt, "BJPF", 4) != 0) continue;
 
     const uint16_t id    = (uint16_t)pkt[4] | ((uint16_t)pkt[5] << 8);
@@ -227,6 +262,26 @@ bool pumpVideo() {
   return complete;
 }
 
+// Boxes come in source-image pixels, so they scale with the picture.
+void drawBoxes() {
+  if (gBoxCount == 0 || millis() - gBoxesAtMs > kBoxStaleMs) return;
+  for (int i = 0; i < gBoxCount; i++) {
+    const Box &b = gBoxes[i];
+    const int x = b.x * gScale + gOffsetX;
+    const int y = b.y * gScale + gOffsetY;
+    const int w = b.w * gScale, h = b.h * gScale;
+    gTft.drawRect(x, y, w, h, ST77XX_GREEN);
+    gTft.drawRect(x - 1, y - 1, w + 2, h + 2, ST77XX_GREEN);   // 2px, more legible
+
+    // Label sits above the box, or inside it when the box is against the top.
+    const int ty = (y >= 10) ? y - 9 : y + 2;
+    gTft.setTextSize(1);
+    gTft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+    gTft.setCursor(x + 1, ty);
+    gTft.printf("%s %u%%", b.label, (unsigned)b.conf);
+  }
+}
+
 bool decodeFrame() {
   const size_t len = gAsmLen;
   if (len == 0 || len > kMaxFrame) return false;
@@ -254,6 +309,8 @@ bool decodeFrame() {
   gJpeg.setPixelType(RGB565_LITTLE_ENDIAN);
   gJpeg.decode(0, 0, 0);
   gJpeg.close();
+
+  drawBoxes();
 
   gFrames++;
   gBytes += len;
