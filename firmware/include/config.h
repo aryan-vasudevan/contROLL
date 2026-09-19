@@ -31,6 +31,24 @@
 #define LOCAL_UDP_PORT   14550
 #define AUTO_DISCOVER_PEER 1
 
+// === Badge -> Pi button link (env:pilink only) ==============================
+// Used by src/pilink_main.cpp, which sends button state to the Raspberry Pi as
+// plain text and lets the Pi decide what the drone should do. None of this
+// affects the MAVLink firmware in main.cpp.
+//
+// PI_IP defaults to the same address as the bridge, because pi/setup.sh puts
+// the access point on 192.168.4.1 either way. The port is deliberately NOT
+// 14550: that one belongs to MAVLink, and keeping them apart means you can run
+// both on the Pi at once without them eating each other's packets.
+#define PI_IP             DRONE_IP
+#define PI_UDP_PORT       14555   // where the Pi listens for button state
+#define PI_UDP_LOCAL_PORT 14556   // where the badge listens for the reply
+
+// Send rates. Fast while a button is held so a press lands promptly, slow when
+// idle so the Pi still has a liveness signal without pointless traffic.
+#define BADGE_SEND_HZ     20
+#define BADGE_IDLE_HZ     2
+
 // === MAVLink identity =======================================================
 // 255 is the conventional ground-station system id. Component 190 marks us as a
 // manual-control station rather than a mission planner.

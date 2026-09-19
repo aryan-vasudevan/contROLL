@@ -16,3 +16,7 @@ firmware/include/secrets.h
 
 # macOS
 .DS_Store
+
+# Python bytecode from running the Pi-side scripts locally.
+__pycache__/
+*.pyc

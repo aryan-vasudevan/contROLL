@@ -38,8 +38,15 @@
 // --- Status LEDs -----------------------------------------------------------
 // GPIO3 -> SN74LVC1T45 level shifter (U11) -> 100R R3 -> LED1.DI, then daisy
 // chained LED1 -> LED2 -> LED3 -> LED4 -> LED5 -> LED6. LED6.DO is unused, so
-// the chain is exactly six pixels. They run off the +5V boost (MT3608, U4),
-// which is gated by slide switch SW1: if the LEDs stay dark, check that switch.
+// the chain is exactly six pixels. They run off +5V.
+//
+// +5V is OR-ed from two sources by U12 (LM66200 ideal-diode mux): USB VBUS on
+// U12.3, and the MT3608 boost output on U12.6. The 3V3 LDO (U5) is fed from
+// that same +5V node, so the whole badge, ESP32 included, hangs off it.
+//
+// Slide switch SW1, silkscreened OFF/ON, gates only the BATTERY path into the
+// boost. On USB the badge and the LEDs run with SW1 in either position; on
+// battery alone SW1 has to be ON or nothing comes up at all.
 #define PIN_LED_DIN   3
 #define LED_COUNT     6
 

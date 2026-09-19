@@ -32,6 +32,8 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <Wire.h>
 #include <math.h>
 #include <stdarg.h>
 #include <string.h>
@@ -376,6 +378,55 @@ void serviceComeActive() {
 // button bit mapping on your badge and to tune the shake threshold.
 uint32_t gLastDiagMs = 0;
 
+// --- I2C bus scan ----------------------------------------------------------
+// Diagnostics only, and the fastest way to find out what is actually on the
+// bus. The accelerometer (U2) and the MFRC522 NFC reader (U7) share SDA/SCL,
+// confirmed from the board file: U2.2 and U7.24 both sit on I2C_SDA_BUS, and
+// U2.12 and U7.31 both sit on I2C_SCL_BUS.
+//
+// The NFC reader has no driver in this firmware. This scan is how you confirm
+// it is alive and at what address before writing one.
+//
+// U7's strapping, all read off the board rather than assumed:
+//   U7.1   10k to +3V3 (R16)  -> interface select HIGH, so I2C, not SPI/UART
+//   U7.6   10k to +3V3 (R14)  -> NRSTPD high, the part is not held in reset
+//   U7.25  10k to +3V3 (R9)   -> address strap 1
+//   U7.26  10k to GND  (R10)  -> address strap 0
+//   U7.27  10k to GND  (R11)  -> address strap 0
+//
+// Under the standard MFRC522 mapping (7-bit address 0b0101 followed by
+// ADR_2..ADR_0) those straps give 0x29. Treat that as a prediction, not a
+// fact: the schematic symbol came from an EasyEDA conversion and names these
+// pins A0/A1/D1-D6 rather than the datasheet's own names, so the pin-function
+// mapping is the one link in the chain that was not verified. The scan settles
+// it either way -- whatever address answers is the real one.
+const char *i2cWhat(uint8_t addr) {
+  if (addr == ACCEL_I2C_ADDR)       return "SC7A20 accelerometer (U2)";
+  if (addr == 0x18)                 return "SC7A20 at the SDO-low address; check R4";
+  if (addr == 0x29)                 return "MFRC522 NFC reader (U7), the predicted address";
+  if (addr >= 0x28 && addr <= 0x2F) return "MFRC522 NFC reader (U7), different address strap";
+  return "unexpected; nothing on this badge should answer here";
+}
+
+void i2cScan() {
+  Serial.println("[badge] I2C scan on SDA=GPIO5 SCL=GPIO6:");
+  int found = 0;
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  0x%02X  %s\n", addr, i2cWhat(addr));
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("  nothing answered. The 4k7 pull-ups are R34 and R36; check "
+                   "those and that SDA/SCL are not swapped.");
+  } else {
+    Serial.printf("  %d device(s). Expect two: 0x%02X and the NFC reader.\n",
+                  found, ACCEL_I2C_ADDR);
+  }
+}
+
 void serviceDiagnostics() {
   leds::setStatus(leds::Status::Booting);
   if (millis() - gLastDiagMs < 200) return;
@@ -397,6 +448,10 @@ void serviceDiagnostics() {
 }
 
 // --- status ----------------------------------------------------------------
+// How long after startup BOOT still selects diagnostics. It cannot be sampled
+// at reset, because GPIO9 is the ESP32-C3 boot strapping pin.
+constexpr uint32_t kDiagWindowMs = 5000;
+
 uint32_t gLastReportMs = 0;
 
 void report() {
@@ -422,7 +477,12 @@ void setup() {
   leds::setStatus(leds::Status::Booting);
 
   btn::poll();
-  const bool diag = btn::down(btn::BOOT);
+  // NOT sampled at reset, on purpose. SW10 shorts GPIO9 to ground and GPIO9 is
+  // the ESP32-C3's boot strapping pin, so holding BOOT through a reset puts the
+  // ROM into serial download mode and this firmware never runs. Diagnostics is
+  // therefore entered from loop(), within kDiagWindowMs of startup: power up
+  // normally, then press and hold BOOT.
+  const bool diag = false;
 
   if (!imu::begin()) {
     Serial.println("[badge] accelerometer did not answer on I2C; "
@@ -437,10 +497,13 @@ void setup() {
 
   if (diag) {
     Serial.println("[badge] BOOT held: diagnostics mode, radio stays off");
+    i2cScan();
     gMode = Mode::Diagnostics;
     return;
   }
 
+  Serial.println("[badge] press and hold BOOT in the next 5s for diagnostics "
+                 "(console only, radio off)");
   dronelink::begin();
   gMode = Mode::WifiConnecting;
   leds::setStatus(leds::Status::WifiConnecting);
@@ -449,6 +512,18 @@ void setup() {
 void loop() {
   btn::poll();
   imu::poll();
+
+  // Diagnostics is selected after the chip is already running; see the note in
+  // setup() about GPIO9. Shut the radio down on the way in so nothing is
+  // transmitted, which is what makes this safe with a battery in the drone.
+  if (gMode != Mode::Diagnostics && millis() < kDiagWindowMs && btn::down(btn::BOOT)) {
+    Serial.println("[badge] BOOT pressed: diagnostics mode, radio off");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    i2cScan();
+    gMode = Mode::Diagnostics;
+    centreSticks();
+  }
 
   if (gMode == Mode::Diagnostics) {
     serviceDiagnostics();

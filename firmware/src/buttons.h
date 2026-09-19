@@ -10,14 +10,17 @@
 // walks D7 down to D0. Mapping the register's input pins to the nets found on
 // the board gives:
 //
-//   U8.6  = D7 = SW_HPM  (SW6)   bit 7
-//   U8.5  = D6 = BTN_7   (SW5)   bit 6
-//   U8.4  = D5 = BTN_6   (SW7)   bit 5
-//   U8.3  = D4 = BTN_5   (SW8)   bit 4
-//   U8.11 = D3 = BTN_1   (SW11)  bit 3
-//   U8.12 = D2 = BTN_2   (SW2)   bit 2
-//   U8.13 = D1 = BTN_3   (SW3)   bit 1
-//   U8.14 = D0 = BTN_4   (SW4)   bit 0
+//   U8.6  = D7 = SW_HPM  (SW6)   bit 7   A
+//   U8.5  = D6 = BTN_7   (SW5)   bit 6   B
+//   U8.4  = D5 = BTN_6   (SW7)   bit 5   HOME
+//   U8.3  = D4 = BTN_5   (SW8)   bit 4   DOWN
+//   U8.14 = D3 = BTN_4   (SW4)   bit 3   LEFT
+//   U8.13 = D2 = BTN_3   (SW3)   bit 2   RIGHT
+//   U8.12 = D1 = BTN_2   (SW2)   bit 1   UP
+//   U8.11 = D0 = BTN_1   (SW11)  bit 0   slide
+//
+// Note the low nibble: pins 11/12/13/14 are D0/D1/D2/D3. Assuming the reverse
+// mirrors the D-pad and is exactly the bug this was caught with on hardware.
 //
 // The physical roles come from where the switches actually sit on the PCB.
 // SW2/SW4/SW3/SW8 form a clean cross around (78.4, 128.8) mm, so they are the
@@ -25,9 +28,13 @@
 // which is the usual A/B pair, A being the outer one. SW11 is a slide switch,
 // not a pushbutton, so it reads as a level rather than a press.
 //
-// There is no silkscreen on this board naming the buttons. If A and B come out
-// swapped on your badge, swap the two BIT_ values below; everything else keys
-// off these names.
+// CONFIRMED against the board's own silkscreen. The labels are drawn as vector
+// outlines rather than KiCad text objects, which is why a text search of the
+// board file finds nothing and an earlier version of this comment claimed the
+// buttons were unlabelled. Rendering the F.SilkS artwork shows UP / LEFT /
+// RIGHT / DOWN with arrows on the cross, A on the outer button of the diagonal
+// pair and B on the inner one, HOME on SW7 and START on SW10. Every role below
+// matches. Nothing here needs swapping.
 // ---------------------------------------------------------------------------
 
 namespace btn {
