@@ -112,6 +112,39 @@ with OakCamera(model="yolov6-nano", classes=["person"]) as cam:
             print(f"{d.label} at {x:.2f},{y:.2f} covering {d.area:.1%}")
 ```
 
+## Benchmarking the Pi from your laptop
+
+To find out how well the Pi actually copes, power it properly, SSH in from
+wherever you like, and run:
+
+```
+python3 benchmark.py                 # 30 s with detection
+python3 benchmark.py --compare       # video only vs detection, tabulated
+python3 benchmark.py --duration 120  # longer, to let it get hot
+```
+
+There is a distinction worth being precise about. **Powering** the Pi from a
+laptop caps its USB ports at 600 mA and gives you a benchmark of a struggling
+board. **Connecting** to it from a laptop over SSH is exactly right and changes
+nothing about the measurement. Power it from its own supply, then drive it from
+your desk.
+
+The frame rate is not the interesting number. Inference runs on the camera, so
+the Pi rarely runs short of CPU. What it runs short of is USB current, and the
+Pi records that in a throttling register rather than reporting it as an error.
+The benchmark reads that register and refuses to call a run honest if
+undervoltage flags are set, because a browned-out board will quietly post worse
+numbers than the hardware deserves.
+
+So a run that reports 30 fps with no throttling flags is a real result. The same
+30 fps with undervoltage recorded means you measured your power supply, not your
+Pi. It exits non-zero in that case, so it can gate a CI job or a pre-flight check.
+
+The report also flags a USB link that negotiated below SuperSpeed, which caps
+throughput regardless of how fast the board is, and a camera processor above
+about 70 C, where it starts throttling itself. In a closed drone shell with no
+airflow, that second one arrives sooner than you would expect.
+
 ## Why MJPEG for the video
 
 There is no monitor on a flying drone. If the Pi is already the Wi-Fi access
@@ -134,6 +167,7 @@ about seeing boxes, the camera can encode H.264 itself and save the Pi the work.
 |---|---|
 | `setup.sh` | venv, DepthAI, udev rule, power check. Run once. |
 | `check.py` | diagnoses the whole chain and says what to fix. Needs the camera. |
+| `benchmark.py` | measures frame rate, load, temperature and throttling |
 | `selftest.py` | logic tests that need no camera and no Pi |
 | `oakcam.py` | the camera wrapper everything else builds on |
 | `detect.py` | the application: detection, streaming, JSON output |
