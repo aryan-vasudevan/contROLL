@@ -15,13 +15,17 @@ Frames go out at the badge panel's native 320x240, so the badge never scales
 anything either. The ESP32-C3 is the slowest thing in the chain and every
 pixel it does not have to touch is worth having.
 
-Wire format, little-endian because the ESP32 is:
+UDP rather than TCP, on purpose. A lost packet on a weak link makes TCP stop
+the whole stream until it is retransmitted, which for video is backwards: a
+frame that arrives late is worth less than the one after it. Over UDP a lost
+packet costs one frame and the next is already on its way.
 
-    "BJPG"  uint32 length  <length bytes of JPEG>
+Frames are chunked by hand rather than left to IP fragmentation, so every
+datagram fits inside an MTU:
 
-A raw framed stream rather than HTTP multipart: no header parsing, no
-boundary scanning, and the badge can resynchronise on the magic if it ever
-loses its place.
+    "BJPF" u16 frame_id  u8 chunk  u8 chunk_count  u16 length  <payload>
+
+The badge asks for each frame, which is also how the Pi learns its address.
 
 Useful without a badge:
 
@@ -35,7 +39,11 @@ import struct
 import sys
 import time
 
-MAGIC = b"BJPG"
+MAGIC = b"BJPF"
+# Chunks stay under a 1500-byte MTU. Letting IP fragment a 10 KB datagram means
+# losing the whole frame if any one fragment goes missing, and some of those
+# fragments would be lost on exactly the weak link this is meant to survive.
+CHUNK = 1400
 DEFAULT_PORT = 14557          # 14555/14556 belong to the button link
 
 
@@ -102,92 +110,71 @@ def save_frames(dai, args):
 def serve(dai, args):
     pipeline, queue = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.bind, args.port))
-    srv.listen(1)
-    srv.settimeout(1.0)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((args.bind, args.port))
+    sock.settimeout(1.0)
 
-    print(f"oak_stream on {args.bind}:{args.port}")
+    print(f"oak_stream on {args.bind}:{args.port} (UDP)")
     print(f"  {args.width}x{args.height} @ {args.fps} fps, MJPEG quality {args.quality}")
     print("  waiting for the badge; ctrl-c to stop")
+
+    frame_id = 0
+    frames = dropped = total_bytes = 0
+    last_report = time.monotonic()
+    peer = None
 
     with pipeline:
         pipeline.start()
         try:
             while True:
+                # One request, one frame. Over UDP this is also the only way we
+                # learn where the badge is, and it doubles as the signal that it
+                # is still alive and keeping up.
                 try:
-                    conn, addr = srv.accept()
+                    _, peer = sock.recvfrom(64)
                 except socket.timeout:
-                    # Keep draining the camera while nobody is connected, so
-                    # the first frame a client gets is current rather than
-                    # whatever was sitting in the queue from minutes ago.
                     try:
-                        queue.tryGet()
+                        queue.tryGet()      # keep the camera's queue current
                     except Exception:
                         pass
                     continue
 
-                print(f"  client {addr[0]} connected")
-                # Nagle would coalesce small writes and add latency for no gain
-                # here; frames are already batched.
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(10.0)
-                served(conn, addr, queue, args)
+                pkt = queue.get()
+                jpeg = bytes(pkt.getData())
+                while True:
+                    try:
+                        newer = queue.tryGet()
+                    except Exception:
+                        newer = None
+                    if newer is None:
+                        break
+                    jpeg = bytes(newer.getData())
+                    dropped += 1
+
+                frame_id = (frame_id + 1) & 0xFFFF
+                total = (len(jpeg) + CHUNK - 1) // CHUNK
+                for i in range(total):
+                    part = jpeg[i * CHUNK:(i + 1) * CHUNK]
+                    header = MAGIC + struct.pack("<HBBH", frame_id, i, total, len(part))
+                    sock.sendto(header + part, peer)
+
+                frames += 1
+                total_bytes += len(jpeg)
+
+                now = time.monotonic()
+                if now - last_report >= 5.0:
+                    span = now - last_report
+                    print(f"  {frames / span:5.1f} fps   "
+                          f"{total_bytes / span / 1024:6.1f} KB/s   "
+                          f"{total_bytes // max(frames, 1):5d} B/frame   "
+                          f"{dropped} stale dropped")
+                    last_report, frames, total_bytes, dropped = now, 0, 0, 0
         except KeyboardInterrupt:
             print("\n  stopping")
         finally:
-            srv.close()
+            sock.close()
     return 0
-
-
-def served(conn, addr, queue, args):
-    """Pump frames to one client until it goes away."""
-    frames = dropped = total_bytes = 0
-    started = last_report = time.monotonic()
-    try:
-        while True:
-            # Wait to be asked. Sending continuously fills the socket buffer
-            # whenever the badge decodes slower than the camera produces, and
-            # every queued frame is latency the viewer sees. One request, one
-            # frame means the pipe never holds more than the frame in flight,
-            # so lag stays at one frame however slow the badge is.
-            if not conn.recv(1):
-                break
-
-            pkt = queue.get()
-            jpeg = bytes(pkt.getData())
-
-            # Everything behind it is older than what was just asked for.
-            while True:
-                try:
-                    newer = queue.tryGet()
-                except Exception:
-                    newer = None
-                if newer is None:
-                    break
-                jpeg = bytes(newer.getData())
-                dropped += 1
-
-            conn.sendall(MAGIC + struct.pack("<I", len(jpeg)) + jpeg)
-            frames += 1
-            total_bytes += len(jpeg)
-
-            now = time.monotonic()
-            if now - last_report >= 5.0:
-                span = now - last_report
-                print(f"  {frames / (now - started):5.1f} fps avg   "
-                      f"{total_bytes / span / 1024:6.1f} KB/s   "
-                      f"{total_bytes // max(frames, 1):5d} B/frame   "
-                      f"{dropped} stale dropped")
-                last_report, total_bytes = now, 0
-    except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as exc:
-        print(f"  client {addr[0]} gone ({type(exc).__name__})")
-    finally:
-        try:
-            conn.close()
-        except OSError:
-            pass
 
 
 def main():

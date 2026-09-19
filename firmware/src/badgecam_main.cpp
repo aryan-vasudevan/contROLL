@@ -50,7 +50,7 @@ JPEGDEC          gJpeg;
 Preferences      gPrefs;
 bool             gFullClock = false;
 
-WiFiClient gStream;
+WiFiUDP    gVideo;
 WiFiUDP    gUdp;
 IPAddress  gPeer;
 
@@ -59,6 +59,8 @@ IPAddress  gPeer;
 // convince us to allocate something absurd.
 constexpr size_t   kMaxFrame     = 48 * 1024;
 constexpr uint16_t kStreamPort   = 14557;
+constexpr uint16_t kVideoLocalPort = 14558;
+constexpr size_t   kChunk        = 1400;
 constexpr uint32_t kReconnectMs  = 3000;
 constexpr uint32_t kStallMs      = 4000;
 
@@ -164,92 +166,98 @@ void banner(const char *line1, const char *line2) {
 
 // --- stream ----------------------------------------------------------------
 
-// Blocking read of exactly n bytes, with a deadline. Short reads are normal on
-// a TCP stream and a partial frame is worse than no frame.
-bool readExactly(uint8_t *dst, size_t n, uint32_t timeoutMs) {
-  const uint32_t deadline = millis() + timeoutMs;
-  size_t got = 0;
-  while (got < n) {
-    if (!gStream.connected()) return false;
-    const int r = gStream.read(dst + got, n - got);
-    if (r > 0) {
-      got += (size_t)r;
-    } else if ((int32_t)(millis() - deadline) >= 0) {
-      return false;
-    } else {
-      delay(1);
-    }
-  }
-  return true;
+// Reassemble one frame from its chunks.
+//
+// UDP rather than TCP because a lost packet on a weak link makes TCP stall the
+// entire stream until it is retransmitted, and a frame that arrives late is
+// worth less than the one behind it. Here a lost chunk costs exactly one
+// frame: the partial is abandoned the moment a newer frame_id turns up.
+//
+// Chunks are sized by the Pi to fit inside an MTU, so IP never fragments them.
+// A fragmented 10 KB datagram would be lost entire if any one fragment went
+// missing, which is precisely what happens on the link this is meant to ride.
+uint16_t gAsmId      = 0xFFFF;
+uint8_t  gAsmCount   = 0;
+uint32_t gAsmMask    = 0;      // bit per chunk received; 32 chunks is 44 KB
+size_t   gAsmLen     = 0;
+bool     gAsmActive  = false;
+
+void requestFrame() {
+  gVideo.beginPacket(gPeer, kStreamPort);
+  gVideo.write((const uint8_t *)"R", 1);
+  gVideo.endPacket();
 }
 
-// Hunt for "BJPG". Resynchronising on a magic is why the wire format has one:
-// after any hiccup we can find the next frame boundary without guessing.
-bool findMagic(uint32_t timeoutMs) {
-  const uint32_t deadline = millis() + timeoutMs;
-  int matched = 0;
-  const char want[4] = {'B', 'J', 'P', 'G'};
-  while (matched < 4) {
-    if (!gStream.connected()) return false;
-    const int c = gStream.read();
-    if (c < 0) {
-      if ((int32_t)(millis() - deadline) >= 0) return false;
-      delay(1);
-      continue;
+// True when a whole frame has been reassembled into gFrame.
+bool pumpVideo() {
+  uint8_t pkt[kChunk + 16];
+  int size;
+  bool complete = false;
+
+  while ((size = gVideo.parsePacket()) > 0) {
+    const int n = gVideo.read(pkt, sizeof(pkt));
+    if (n < 10 || memcmp(pkt, "BJPF", 4) != 0) continue;
+
+    const uint16_t id    = (uint16_t)pkt[4] | ((uint16_t)pkt[5] << 8);
+    const uint8_t  idx   = pkt[6];
+    const uint8_t  count = pkt[7];
+    const uint16_t len   = (uint16_t)pkt[8] | ((uint16_t)pkt[9] << 8);
+
+    if (count == 0 || count > 32 || idx >= count) continue;
+    if (len > kChunk || (size_t)(10 + len) > (size_t)n) continue;
+    if ((size_t)idx * kChunk + len > kMaxFrame) continue;
+
+    if (id != gAsmId) {
+      // A newer frame started. Whatever was half-assembled is now stale, and
+      // waiting for its missing chunk would only add latency.
+      gAsmId = id; gAsmCount = count; gAsmMask = 0; gAsmLen = 0; gAsmActive = true;
     }
-    matched = (c == want[matched]) ? matched + 1 : (c == 'B' ? 1 : 0);
+    memcpy(gFrame + (size_t)idx * kChunk, pkt + 10, len);
+    gAsmMask |= (1UL << idx);
+    if (idx == count - 1) gAsmLen = (size_t)idx * kChunk + len;
+
+    const uint32_t want = (count >= 32) ? 0xFFFFFFFFUL : ((1UL << count) - 1);
+    if (gAsmActive && gAsmMask == want && gAsmLen > 0) {
+      gAsmActive = false;
+      complete = true;
+      // Keep draining: if a newer frame is already queued behind this one, we
+      // would rather decode that than something older.
+    }
   }
-  return true;
+  return complete;
 }
 
-bool readFrame() {
-  if (!findMagic(1500)) return false;
+bool decodeFrame() {
+  const size_t len = gAsmLen;
+  if (len == 0 || len > kMaxFrame) return false;
 
-  uint8_t lenBytes[4];
-  if (!readExactly(lenBytes, 4, 500)) return false;
-  const uint32_t len = (uint32_t)lenBytes[0] | ((uint32_t)lenBytes[1] << 8) |
-                       ((uint32_t)lenBytes[2] << 16) | ((uint32_t)lenBytes[3] << 24);
-
-  if (len == 0 || len > kMaxFrame) {
-    Serial.printf("[cam] absurd frame length %lu; resyncing\n", (unsigned long)len);
-    return false;
-  }
-  if (!readExactly(gFrame, len, 2000)) return false;
-
-  if (gJpeg.openRAM(gFrame, (int)len, onJpegBlock)) {
-    // Work the scale out from the image itself, so the Pi can change
-    // resolution without the badge needing a reflash to match.
-    const int iw = gJpeg.getWidth(), ih = gJpeg.getHeight();
-    int scale = 1;
-    if (iw > 0 && ih > 0) {
-      scale = min(gTft.width() / iw, gTft.height() / ih);
-      scale = constrain(scale, 1, kMaxScale);
-    }
-    if (scale != gScale) {
-      Serial.printf("[cam] %dx%d source, drawing at %dx\n", iw, ih, scale);
-      gTft.fillScreen(ST77XX_BLACK);
-    }
-    gScale   = scale;
-    gOffsetX = (gTft.width()  - iw * scale) / 2;
-    gOffsetY = (gTft.height() - ih * scale) / 2;
-
-    gJpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-    gJpeg.decode(0, 0, 0);
-    gJpeg.close();
-  } else {
+  if (!gJpeg.openRAM(gFrame, (int)len, onJpegBlock)) {
     Serial.println("[cam] JPEGDEC refused the frame");
     return false;
   }
+  // Work the scale out from the image itself, so the Pi can change resolution
+  // without the badge needing a reflash to match.
+  const int iw = gJpeg.getWidth(), ih = gJpeg.getHeight();
+  int scale = 1;
+  if (iw > 0 && ih > 0) {
+    scale = min(gTft.width() / iw, gTft.height() / ih);
+    scale = constrain(scale, 1, kMaxScale);
+  }
+  if (scale != gScale) {
+    Serial.printf("[cam] %dx%d source, drawing at %dx\n", iw, ih, scale);
+    gTft.fillScreen(ST77XX_BLACK);
+  }
+  gScale   = scale;
+  gOffsetX = (gTft.width()  - iw * scale) / 2;
+  gOffsetY = (gTft.height() - ih * scale) / 2;
+
+  gJpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  gJpeg.decode(0, 0, 0);
+  gJpeg.close();
 
   gFrames++;
   gBytes += len;
   gLastFrameMs = millis();
-
-  // Ask for the next one now. The Pi sends exactly one frame per request, so
-  // nothing can pile up in the socket and latency stays at a single frame
-  // however slowly the badge decodes.
-  gStream.write('R');
-  gStream.flush();
   return true;
 }
 
@@ -332,6 +340,7 @@ void setup() {
 
   gPeer.fromString(PI_IP);
   gUdp.begin(PI_UDP_LOCAL_PORT);
+  gVideo.begin(kVideoLocalPort);
   Serial.printf("[cam] joining \"%s\", stream from %s:%u\n",
                 WIFI_SSID, PI_IP, kStreamPort);
 }
@@ -343,6 +352,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (gFullClock) {
       gFullClock = false;
+      gAsmActive = false;
       setCpuFrequencyMhz(CPU_MHZ);   // back to the cheap clock to re-associate
     }
     leds::setStatus(leds::Status::WifiConnecting);
@@ -362,6 +372,8 @@ void loop() {
     setCpuFrequencyMhz(160);
     Serial.printf("[cam] on the network; cpu -> %u MHz for decoding\n",
                   (unsigned)getCpuFrequencyMhz());
+    gLastFrameMs = millis();
+    requestFrame();
   }
 
   // Buttons carry on regardless of whether video is flowing.
@@ -371,35 +383,21 @@ void loop() {
     sendButtons();
   }
 
-  if (!gStream.connected()) {
+  // No connection to hold open: the request is the only state there is, and it
+  // doubles as telling the Pi where to send. Re-asking after a gap covers a
+  // lost request as well as a Pi that restarted.
+  if (millis() - gLastFrameMs > kStallMs && millis() - gLastTryMs > kReconnectMs) {
+    gLastTryMs = millis();
+    Serial.printf("[cam] no frames; asking %s:%u again\n", PI_IP, kStreamPort);
+    banner("waiting for video", PI_IP);
+    requestFrame();
     leds::setStatus(leds::Status::LinkWaiting);
-    if (millis() - gLastTryMs >= kReconnectMs) {
-      gLastTryMs = millis();
-      Serial.printf("[cam] connecting to %s:%u\n", PI_IP, kStreamPort);
-      banner("connecting", PI_IP);
-      if (gStream.connect(gPeer, kStreamPort, 3000)) {
-        gStream.setNoDelay(true);
-        gLastFrameMs = millis();
-        gStream.write('R');      // prime the pump
-        gStream.flush();
-        Serial.println("[cam] stream open");
-      }
-    }
-    return;
   }
 
-  if (!readFrame()) {
-    // A frame that will not parse is usually a stream that has got out of
-    // step, and the magic hunt recovers from that. A stall is different: the
-    // Pi has gone away and the socket has to be rebuilt.
-    if (millis() - gLastFrameMs > kStallMs) {
-      Serial.println("[cam] no frames; dropping the stream");
-      gStream.stop();
-    }
-    return;
+  if (pumpVideo() && decodeFrame()) {
+    leds::setStatus(btn::anyDown() ? leds::Status::Flying : leds::Status::Disarmed);
+    requestFrame();   // ask for the next now that this one is on the panel
   }
-
-  leds::setStatus(btn::anyDown() ? leds::Status::Flying : leds::Status::Disarmed);
 
   if (millis() - gLastStatMs >= 5000) {
     const float secs = (millis() - gLastStatMs) / 1000.0f;
