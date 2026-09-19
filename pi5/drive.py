@@ -71,6 +71,9 @@ MOVES = {
 }
 
 
+_probed = False   # the pin-factory check above runs once per process
+
+
 class DriveError(Exception):
     """Something is wrong with the setup, and the message says what."""
 
@@ -90,16 +93,23 @@ def _outputs(dry_run: bool):
             "Not on a Pi? Use --dry-run to check the logic without hardware."
         )
 
-    try:
-        DigitalOutputDevice(LEFT_PINS["forward"]).close()
-    except Exception as exc:
-        raise DriveError(
-            f"gpiozero could not take GPIO {LEFT_PINS['forward']}: {exc}\n"
-            "On a Pi 5 this is almost always the pin factory. RPi.GPIO does "
-            "not work on the Pi 5 at all; gpiozero needs lgpio.\n"
-            "  sudo apt install python3-lgpio\n"
-            "If another process holds the pin, find it with: sudo lsof /dev/gpiochip0"
-        )
+    # Probe the pin factory once per process, not once per Side. _outputs() is
+    # called while building each side, and by the time the second one runs the
+    # first already holds this pin -- so probing it again reports "already in
+    # use" and blames the pin factory for the script's own grip on it.
+    global _probed
+    if not _probed:
+        try:
+            DigitalOutputDevice(LEFT_PINS["forward"]).close()
+        except Exception as exc:
+            raise DriveError(
+                f"gpiozero could not take GPIO {LEFT_PINS['forward']}: {exc}\n"
+                "On a Pi 5 this is almost always the pin factory. RPi.GPIO does "
+                "not work on the Pi 5 at all; gpiozero needs lgpio.\n"
+                "  sudo apt install python3-lgpio\n"
+                "If another process holds the pin, find it with: sudo lsof /dev/gpiochip0"
+            )
+        _probed = True
 
     return PWMOutputDevice, DigitalOutputDevice
 
