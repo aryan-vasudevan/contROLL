@@ -82,6 +82,19 @@
 // _15dBm, _13dBm, _11dBm, _8_5dBm, _7dBm, _5dBm, _2dBm.
 #define WIFI_TX_POWER     WIFI_POWER_11dBm
 
+// CPU clock. The radio needs at least 80 MHz, and the C3 draws roughly half
+// as much there as at 160. Nothing in the button link is compute-bound, so
+// this is close to free.
+//
+// RAISE THIS TO 160 before doing anything with the camera: JPEG decode is
+// entirely compute-bound and halving the clock halves the frame rate.
+#define CPU_MHZ           80
+
+// Settle time before the radio comes up. Two AA cells through a boost
+// converter sag under the inrush of everything starting at once, and an
+// association attempt launched into that brownout is one that fails.
+#define RADIO_SETTLE_MS   400
+
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
 #define BADGE_SEND_HZ     20
