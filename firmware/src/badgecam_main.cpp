@@ -63,6 +63,13 @@ constexpr uint32_t kReconnectMs  = 3000;
 constexpr uint32_t kStallMs      = 4000;
 
 uint8_t  gFrame[kMaxFrame];
+
+// One decoded MCU block, expanded. JPEGDEC blocks are at most 16x16, so at the
+// largest scale we support this is 64x64 pixels.
+constexpr int kMaxScale = 4;
+uint16_t gScaled[16 * kMaxScale * 16 * kMaxScale];
+int      gScale   = 1;          // worked out per frame from the image size
+int      gOffsetX = 0, gOffsetY = 0;
 uint32_t gLastFrameMs = 0;
 uint32_t gLastTryMs   = 0;
 uint32_t gLastStatMs  = 0;
@@ -76,7 +83,33 @@ uint32_t gLastBtnMs   = 0;
 // JPEGDEC hands back one decoded block at a time. Pushing each straight to the
 // panel is the whole reason no framebuffer is needed.
 int onJpegBlock(JPEGDRAW *block) {
-  gTft.drawRGBBitmap(block->x, block->y, block->pPixels, block->iWidth, block->iHeight);
+  if (gScale == 1) {
+    gTft.drawRGBBitmap(block->x + gOffsetX, block->y + gOffsetY,
+                       block->pPixels, block->iWidth, block->iHeight);
+    return 1;
+  }
+
+  // Nearest-neighbour expansion. The camera sends a quarter of the panel's
+  // pixels because decode time is what limits the frame rate, and duplicating
+  // pixels here is far cheaper than decoding four times as many. The picture
+  // is softer; that is the trade being made deliberately.
+  const int sw = block->iWidth, sh = block->iHeight;
+  const int dw = sw * gScale;
+  for (int y = 0; y < sh; y++) {
+    uint16_t *dst = gScaled + (size_t)y * gScale * dw;
+    const uint16_t *src = block->pPixels + (size_t)y * sw;
+    for (int x = 0; x < sw; x++) {
+      const uint16_t px = src[x];
+      for (int k = 0; k < gScale; k++) dst[x * gScale + k] = px;
+    }
+    // The remaining rows of this source row are identical; copy rather than
+    // recompute.
+    for (int r = 1; r < gScale; r++) {
+      memcpy(dst + (size_t)r * dw, dst, (size_t)dw * sizeof(uint16_t));
+    }
+  }
+  gTft.drawRGBBitmap(block->x * gScale + gOffsetX, block->y * gScale + gOffsetY,
+                     gScaled, dw, sh * gScale);
   return 1;
 }
 
@@ -167,6 +200,22 @@ bool readFrame() {
   if (!readExactly(gFrame, len, 2000)) return false;
 
   if (gJpeg.openRAM(gFrame, (int)len, onJpegBlock)) {
+    // Work the scale out from the image itself, so the Pi can change
+    // resolution without the badge needing a reflash to match.
+    const int iw = gJpeg.getWidth(), ih = gJpeg.getHeight();
+    int scale = 1;
+    if (iw > 0 && ih > 0) {
+      scale = min(gTft.width() / iw, gTft.height() / ih);
+      scale = constrain(scale, 1, kMaxScale);
+    }
+    if (scale != gScale) {
+      Serial.printf("[cam] %dx%d source, drawing at %dx\n", iw, ih, scale);
+      gTft.fillScreen(ST77XX_BLACK);
+    }
+    gScale   = scale;
+    gOffsetX = (gTft.width()  - iw * scale) / 2;
+    gOffsetY = (gTft.height() - ih * scale) / 2;
+
     gJpeg.setPixelType(RGB565_LITTLE_ENDIAN);
     gJpeg.decode(0, 0, 0);
     gJpeg.close();
@@ -178,6 +227,12 @@ bool readFrame() {
   gFrames++;
   gBytes += len;
   gLastFrameMs = millis();
+
+  // Ask for the next one now. The Pi sends exactly one frame per request, so
+  // nothing can pile up in the socket and latency stays at a single frame
+  // however slowly the badge decodes.
+  gStream.write('R');
+  gStream.flush();
   return true;
 }
 
@@ -234,7 +289,7 @@ void setup() {
   // it in the 320x240 landscape the camera feed is sized for.
   gSpi.begin(PIN_DISP_SCLK, -1 /* no MISO */, PIN_DISP_MOSI, PIN_DISP_CS);
   gTft.init(240, 320);
-  gTft.setSPISpeed(40000000);
+  gTft.setSPISpeed(80000000);   // 40 MHz was costing ~15 ms a frame
   gTft.setRotation(1);
   gTft.fillScreen(ST77XX_BLACK);
   testPattern();
@@ -252,8 +307,11 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  WiFi.setTxPower(WIFI_TX_POWER);
-  WiFi.setSleep(true);
+  // Full transmit power here, unlike the button-only firmware. Dropped frames
+  // at a distance are a link-budget problem, and the badge's uplink carries
+  // the frame requests -- lose those and the video stops entirely.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setSleep(false);   // modem sleep adds latency to every frame request
 
   gPeer.fromString(PI_IP);
   gUdp.begin(PI_UDP_LOCAL_PORT);
@@ -305,6 +363,8 @@ void loop() {
       if (gStream.connect(gPeer, kStreamPort, 3000)) {
         gStream.setNoDelay(true);
         gLastFrameMs = millis();
+        gStream.write('R');      // prime the pump
+        gStream.flush();
         Serial.println("[cam] stream open");
       }
     }

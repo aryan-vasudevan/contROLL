@@ -132,7 +132,7 @@ def serve(dai, args):
                 # Nagle would coalesce small writes and add latency for no gain
                 # here; frames are already batched.
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(5.0)
+                conn.settimeout(10.0)
                 served(conn, addr, queue, args)
         except KeyboardInterrupt:
             print("\n  stopping")
@@ -147,12 +147,18 @@ def served(conn, addr, queue, args):
     started = last_report = time.monotonic()
     try:
         while True:
+            # Wait to be asked. Sending continuously fills the socket buffer
+            # whenever the badge decodes slower than the camera produces, and
+            # every queued frame is latency the viewer sees. One request, one
+            # frame means the pipe never holds more than the frame in flight,
+            # so lag stays at one frame however slow the badge is.
+            if not conn.recv(1):
+                break
+
             pkt = queue.get()
             jpeg = bytes(pkt.getData())
 
-            # Anything already queued behind this one is stale. Throwing it
-            # away is what keeps latency flat instead of growing without bound
-            # whenever the badge cannot keep up.
+            # Everything behind it is older than what was just asked for.
             while True:
                 try:
                     newer = queue.tryGet()
@@ -187,11 +193,15 @@ def served(conn, addr, queue, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--width", type=int, default=320, help="badge panel is 320 wide")
-    ap.add_argument("--height", type=int, default=240, help="badge panel is 240 tall")
-    ap.add_argument("--fps", type=int, default=15,
-                    help="the ESP32-C3 decodes at roughly 10-15 fps; asking for "
-                         "more just wastes camera and radio")
+    # Half the panel's resolution in each axis, so the badge scales up by an
+    # exact factor of two. Decode cost scales with pixel count and it is the
+    # badge's bottleneck, so a quarter of the pixels is most of the frame rate.
+    # Softer, and much faster. 320x240 for a sharp, slow picture.
+    ap.add_argument("--width", type=int, default=160)
+    ap.add_argument("--height", type=int, default=120)
+    ap.add_argument("--fps", type=int, default=30,
+                    help="ceiling only; the badge asks for each frame, so the "
+                         "real rate is whatever it can keep up with")
     ap.add_argument("--quality", type=int, default=70, help="MJPEG quality, 1-100")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0")

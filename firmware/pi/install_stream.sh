@@ -43,11 +43,22 @@ if [[ "$HERE/oak_stream.py" != "$HOME_DIR/oak_stream.py" ]]; then
   echo "    copied oak_stream.py to $HOME_DIR"
 fi
 
-# Prove the camera is actually claimable before wiring this to boot. A unit
-# that crash-loops against absent hardware is worse than no unit.
+# Prove the camera is there before wiring this to boot. A unit that crash-loops
+# against absent hardware is worse than no unit.
+#
+# If the service is already running it holds the device, and depthai will not
+# report a claimed device as available -- which looks exactly like an absent
+# camera. Stop the service first so the check tests the hardware rather than
+# our own grip on it.
 say "Checking the camera is there"
-sudo -u "$TARGET_USER" "$VENV/bin/python" "$HOME_DIR/oak_stream.py" --list \
-  || die "no OAK found; not installing the service"
+systemctl stop "$UNIT" 2>/dev/null || true
+sleep 1
+if ! sudo -u "$TARGET_USER" "$VENV/bin/python" "$HOME_DIR/oak_stream.py" --list; then
+  if lsusb | grep -q 03e7; then
+    die "depthai cannot claim the OAK, though lsusb sees it. Something else is holding it."
+  fi
+  die "no OAK found on USB at all; check the cable and the port"
+fi
 
 install -m 644 "$HERE/$UNIT.service" "/etc/systemd/system/$UNIT.service"
 sed -i "s|^User=.*|User=$TARGET_USER|; s|^WorkingDirectory=.*|WorkingDirectory=$HOME_DIR|; \
