@@ -1,0 +1,67 @@
+name: CI
+
+# Runs on pushes and PRs to main and any test/* branch, and on demand.
+on:
+  push:
+    branches: [main, "test/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cloud runner. No camera and no Pi here, so this runs only the tests that
+  # need neither: the OAK-1 code's pure logic and the firmware host tests.
+  # ---------------------------------------------------------------------------
+  camera-software:
+    name: OAK-1 software tests (no hardware)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install DepthAI v3 + deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Self-test (22 checks, no camera needed)
+        run: python selftest.py
+
+  firmware-software:
+    name: Firmware host tests (no hardware)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install g++ and python3
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ python3
+      - name: Run host test suite
+        run: ./tests/run.sh
+
+  # ---------------------------------------------------------------------------
+  # Real hardware. This runs ON YOUR PI 5 once you register it as a self-hosted
+  # runner (see .github/RUNNER.md). It sets the Pi up and talks to the actual
+  # OAK-1. Disabled until a Pi runner exists, so cloud CI is never blocked
+  # waiting for a machine that is not there.
+  # ---------------------------------------------------------------------------
+  camera-hardware:
+    name: OAK-1 on the Pi 5 (real camera)
+    runs-on: [self-hosted, linux, ARM64, oak1]
+    # Flip `false` to `true` after the Pi runner is registered and online.
+    if: false
+    defaults:
+      run:
+        working-directory: pi5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the Pi (venv, DepthAI, udev, power check)
+        run: ./setup.sh < /dev/null   # </dev/null accepts the udev prompt default
+      - name: Diagnose the camera chain
+        run: ~/oakenv/bin/python check.py
+      - name: Self-test on the real board
+        run: ~/oakenv/bin/python selftest.py
