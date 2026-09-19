@@ -40,6 +40,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>
 #include <string.h>
 
 #include "badge_pins.h"
@@ -76,6 +77,25 @@ uint32_t gLastConnectMs = 0;
 // SSID a fresh scan can plainly see, so the attempt has to be restarted
 // rather than waited on.
 constexpr uint32_t kReconnectMs = 8000;
+
+// Why the chip last restarted. Printed at boot because a badge that vanishes
+// mid-session looks identical whether it browned out, panicked or was simply
+// switched off, and those need completely different fixes. A brownout means
+// the batteries, not the code.
+const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_EXT:      return "external reset";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "PANIC -- a crash, look for a backtrace above";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "BROWNOUT -- the supply sagged, replace the batteries";
+    case ESP_RST_DEEPSLEEP:return "woke from deep sleep";
+    default:               return "unknown";
+  }
+}
 
 // Arduino's WiFi status codes, spelled out. Worth having by name: 1 and 4
 // look the same from outside and mean completely different things.
@@ -168,6 +188,9 @@ void setup() {
   leds::begin();
   leds::setStatus(leds::Status::Booting);
 
+  const esp_reset_reason_t why = esp_reset_reason();
+  Serial.printf("[pilink] boot, last reset: %s\n", resetReasonName(why));
+
   btn::poll();
   Serial.println("[pilink] press and hold BOOT in the next 5s for local mode "
                  "(console only, radio off)");
@@ -181,6 +204,11 @@ void setup() {
   // The Pi side should be pinned to RSN/CCMP; this is the belt to that braces.
   WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Transmit power is the biggest lever on peak current, and peak current is
+  // what browns out two AA cells through a boost converter. The Pi is in the
+  // same room at about -50 dBm, which is roughly 40 dB of margin, so there is
+  // plenty to give away here.
+  WiFi.setTxPower(WIFI_TX_POWER);
   leds::setStatus(leds::Status::WifiConnecting);
 
   gPeer.fromString(PI_IP);

@@ -65,6 +65,13 @@
 #define PI_UDP_PORT       14555   // where the Pi listens for button state
 #define PI_UDP_LOCAL_PORT 14556   // where the badge listens for the reply
 
+// Wi-Fi transmit power. Lower means smaller current spikes, which matters a
+// lot on two AA cells through a boost converter: a brownout there looks like
+// a firmware crash and is not one. WIFI_POWER_11dBm still leaves tens of dB
+// of margin against a Pi in the same room. Raise it if the link gets flaky at
+// distance, and expect to pay for it in battery life.
+#define WIFI_TX_POWER     WIFI_POWER_11dBm
+
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
 #define BADGE_SEND_HZ     20
