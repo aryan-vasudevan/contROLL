@@ -1,0 +1,18 @@
+# PlatformIO build output. Large, machine specific, fully regenerable.
+.pio/
+firmware/.pio/
+
+# KiCad per-user state and editor locks. The schematic, board and project
+# files are tracked; these are not.
+*.kicad_prl
+*.kicad_sch-bak
+*.kicad_pcb-bak
+~*.lck
+fp-info-cache
+
+# Local Wi-Fi credentials, if you ever split them out of config.h so they do
+# not get committed by accident.
+firmware/include/secrets.h
+
+# macOS
+.DS_Store

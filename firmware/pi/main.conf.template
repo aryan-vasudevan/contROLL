@@ -1,0 +1,26 @@
+# mavlink-router configuration for the badge controller.
+#
+# Installed to /etc/mavlink-router/main.conf by setup.sh. The placeholders
+# __DEVICE__ and __BAUD__ are filled in there.
+#
+# One serial endpoint talks to the flight controller. One UDP endpoint in
+# Server mode waits for the badge. Server mode matters: it binds the port and
+# learns the badge's address from the badge's own heartbeat, so nothing here
+# has to know what DHCP handed out. The badge sends heartbeats once a second
+# from boot, so the return path opens almost immediately.
+
+[General]
+TcpServerPort = 5760
+ReportStats = false
+MavlinkDialect = common
+DebugLogLevel = info
+
+[UartEndpoint fc]
+Device = __DEVICE__
+Baud = __BAUD__
+FlowControl = false
+
+[UdpEndpoint badge]
+Mode = Server
+Address = 0.0.0.0
+Port = 14550
