@@ -76,6 +76,10 @@ running DroneBridge weighs under eight grams and is the sensible choice. A
 Raspberry Pi 5 also works and is set up by [firmware/pi/](firmware/pi/), at
 roughly 100 grams and a real power budget.
 
+If you go the Pi route, [pi5/](pi5/) adds a Luxonis OAK-1 camera on the same
+board: object detection running on the camera's own processor, with a live view
+you can open in a browser from anywhere on the Pi's network.
+
 One flight controller parameter matters more than all the others:
 
 ```
@@ -95,6 +99,7 @@ button. It looks exactly like a broken setup.
 | `firmware/include/config.h` | Wi-Fi, stick feel, failsafe limits, everything you edit |
 | `firmware/tests/` | host tests, no hardware needed |
 | `firmware/pi/` | Raspberry Pi bridge setup, if you go that route |
+| `pi5/` | OAK-1 camera on a Raspberry Pi 5, vision side |
 | `hardware/` | the badge's KiCad schematic and board |
 
 `hardware/` is Hack the North's own badge design, from their public

@@ -1,0 +1,10 @@
+# DepthAI v3. The v3 API is what oakcam.py is written against; v2 pipelines
+# built from ColorCamera and XLinkOut nodes will not run against it.
+# There is a prebuilt manylinux aarch64 wheel, so nothing compiles on the Pi.
+depthai>=3.10,<4
+
+# Headless by default. The full opencv-python pulls in Qt and GTK, which a
+# drone has no use for. setup.sh --gui swaps in the desktop build instead.
+opencv-python-headless>=4.9
+
+numpy>=1.24

@@ -18,5 +18,11 @@ firmware/include/secrets.h
 .DS_Store
 
 # Python bytecode from running the Pi-side scripts locally.
+# *.py[cod] covers .pyc, .pyo and .pyd in one pattern.
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+
+# DepthAI caches models it downloads from the Luxonis zoo on first run.
+.cache/
