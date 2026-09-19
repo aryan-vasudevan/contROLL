@@ -95,6 +95,14 @@
 // association attempt launched into that brownout is one that fails.
 #define RADIO_SETTLE_MS   400
 
+// The camera is mounted upside down on the car, so the picture is rotated in
+// the badge rather than on the camera. It costs nothing here: the upscaling
+// pass already touches every pixel, and reversing a row-major buffer end to
+// end flips both axes at once. Doing it on the camera would mean another ISP
+// pass and more latency. Set to 0 if the camera is ever mounted the right way
+// up.
+#define CAM_ROTATE_180    1
+
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
 #define BADGE_SEND_HZ     20

@@ -81,6 +81,7 @@ constexpr int kMaxStripPx = 320 * (16 * kMaxScale);
 uint16_t gScaled[kMaxStripPx];
 int      gScale   = 1;          // worked out per frame from the image size
 int      gOffsetX = 0, gOffsetY = 0;
+int      gImgW = 0, gImgH = 0;
 uint32_t gLastFrameMs = 0;
 uint32_t gLastTryMs   = 0;
 uint32_t gLastStatMs  = 0;
@@ -94,7 +95,9 @@ uint32_t gLastBtnMs   = 0;
 // JPEGDEC hands back one decoded block at a time. Pushing each straight to the
 // panel is the whole reason no framebuffer is needed.
 int onJpegBlock(JPEGDRAW *block) {
-  if (gScale == 1) {
+  // The 1x fast path draws the decoder's buffer directly, which cannot be
+  // reversed in place, so rotation always goes the long way round.
+  if (gScale == 1 && !CAM_ROTATE_180) {
     gTft.drawRGBBitmap(block->x + gOffsetX, block->y + gOffsetY,
                        block->pPixels, block->iWidth, block->iHeight);
     return 1;
@@ -105,17 +108,20 @@ int onJpegBlock(JPEGDRAW *block) {
   // pixels here is far cheaper than decoding four times as many. The picture
   // is softer; that is the trade being made deliberately.
   const int sw = block->iWidth, sh = block->iHeight;
-  const int dw = sw * gScale;
+  const int dw = sw * gScale, dh = sh * gScale;
 
   // Never trust the decoder's block geometry against a fixed buffer. Drawing
   // one strip unscaled is a visible glitch; running off the end of this array
   // is a reboot.
-  if ((size_t)dw * sh * gScale > kMaxStripPx) {
+  if ((size_t)dw * dh > kMaxStripPx) {
     gTft.drawRGBBitmap(block->x + gOffsetX, block->y + gOffsetY,
                        block->pPixels, sw, sh);
     return 1;
   }
-  for (int y = 0; y < sh; y++) {
+  if (gScale == 1) {
+    memcpy(gScaled, block->pPixels, (size_t)sw * sh * sizeof(uint16_t));
+  }
+  for (int y = 0; gScale > 1 && y < sh; y++) {
     uint16_t *dst = gScaled + (size_t)y * gScale * dw;
     const uint16_t *src = block->pPixels + (size_t)y * sw;
     for (int x = 0; x < sw; x++) {
@@ -128,8 +134,20 @@ int onJpegBlock(JPEGDRAW *block) {
       memcpy(dst + (size_t)r * dw, dst, (size_t)dw * sizeof(uint16_t));
     }
   }
-  gTft.drawRGBBitmap(block->x * gScale + gOffsetX, block->y * gScale + gOffsetY,
-                     gScaled, dw, sh * gScale);
+#if CAM_ROTATE_180
+  // A 180 degree rotation of a row-major image is just reversing the buffer end
+  // to end: that mirrors rows and columns in a single pass.
+  for (int a = 0, b = dw * dh - 1; a < b; a++, b--) {
+    const uint16_t t = gScaled[a]; gScaled[a] = gScaled[b]; gScaled[b] = t;
+  }
+  // The strip lands as far from the far edge as it started from the near one.
+  const int dx = gOffsetX + (gImgW - block->x - sw) * gScale;
+  const int dy = gOffsetY + (gImgH - block->y - sh) * gScale;
+#else
+  const int dx = block->x * gScale + gOffsetX;
+  const int dy = block->y * gScale + gOffsetY;
+#endif
+  gTft.drawRGBBitmap(dx, dy, gScaled, dw, dh);
   return 1;
 }
 
@@ -267,8 +285,13 @@ void drawBoxes() {
   if (gBoxCount == 0 || millis() - gBoxesAtMs > kBoxStaleMs) return;
   for (int i = 0; i < gBoxCount; i++) {
     const Box &b = gBoxes[i];
-    const int x = b.x * gScale + gOffsetX;
-    const int y = b.y * gScale + gOffsetY;
+#if CAM_ROTATE_180
+    const int sx = gImgW - b.x - (int)b.w, sy = gImgH - b.y - (int)b.h;
+#else
+    const int sx = b.x, sy = b.y;
+#endif
+    const int x = sx * gScale + gOffsetX;
+    const int y = sy * gScale + gOffsetY;
     const int w = b.w * gScale, h = b.h * gScale;
     gTft.drawRect(x, y, w, h, ST77XX_GREEN);
     gTft.drawRect(x - 1, y - 1, w + 2, h + 2, ST77XX_GREEN);   // 2px, more legible
@@ -303,6 +326,8 @@ bool decodeFrame() {
     gTft.fillScreen(ST77XX_BLACK);
   }
   gScale   = scale;
+  gImgW    = iw;
+  gImgH    = ih;
   gOffsetX = (gTft.width()  - iw * scale) / 2;
   gOffsetY = (gTft.height() - ih * scale) / 2;
 
