@@ -1,0 +1,36 @@
+[Unit]
+# Runs badge_listen.py from boot so the Pi needs no laptop and no login. The
+# point of the badge link is that you power the Pi, power the badge, and press
+# buttons; anything that needs an SSH session first is not that.
+Description=Badge button listener
+Documentation=https://github.com/aryan-vasudevan/drone-hacking
+After=network.target NetworkManager.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+# -u because journald reads the pipe, not a terminal, and a block-buffered
+# stdout would hold lines back until the buffer filled.
+ExecStart=/usr/bin/python3 -u /home/pi/badge_listen.py --port 14555
+
+# The badge keeps transmitting whether or not anything is listening, so the
+# listener coming back by itself is always the right answer.
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+# It only ever binds a UDP port and prints, so give it nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

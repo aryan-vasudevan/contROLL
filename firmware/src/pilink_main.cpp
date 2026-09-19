@@ -40,6 +40,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>
 #include <string.h>
 
 #include "badge_pins.h"
@@ -66,6 +67,89 @@ constexpr uint32_t kAckTimeoutMs = 2000;
 // at reset -- see the note at the top of this file about GPIO9 being the boot
 // strapping pin -- so the window has to live here instead.
 constexpr uint32_t kModeWindowMs = 5000;
+
+bool     gScanned = false;   // the one-shot diagnostic scan below
+uint32_t gLastConnectMs = 0;
+uint16_t gConnectAttempts = 0;
+
+// The badge is usually powered before the Pi has finished booting, so the
+// access point appears after the first connect attempt has already failed.
+// The ESP32 latches that failure and keeps reporting WL_NO_SSID_AVAIL for an
+// SSID a fresh scan can plainly see, so the attempt has to be restarted
+// rather than waited on.
+constexpr uint32_t kReconnectMs = 8000;
+
+// Escalating recovery. Re-running WiFi.begin() against an access point holding
+// stale state for our MAC fails the same way forever, so retrying alone is not
+// enough: every fourth attempt tears the radio down completely, which drops any
+// cached BSSID and channel, and if even that has not worked after about two
+// minutes the whole chip restarts. A badge that reboots itself once is a far
+// better outcome than a badge that sits there blue while someone wonders
+// whether to power-cycle it.
+constexpr uint16_t kHardResetEvery   = 4;
+constexpr uint16_t kRebootAfter      = 15;   // x kReconnectMs = about 2 minutes
+
+// Why the chip last restarted. Printed at boot because a badge that vanishes
+// mid-session looks identical whether it browned out, panicked or was simply
+// switched off, and those need completely different fixes. A brownout means
+// the batteries, not the code.
+const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_EXT:      return "external reset";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "PANIC -- a crash, look for a backtrace above";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "BROWNOUT -- the supply sagged, replace the batteries";
+    case ESP_RST_DEEPSLEEP:return "woke from deep sleep";
+    default:               return "unknown";
+  }
+}
+
+// The 802.11 reason code the access point (or our own stack) gave for the last
+// disconnect. WL_CONNECT_FAILED lumps a wrong password together with a
+// handshake that timed out and a cipher the AP refused, and those are three
+// different problems. This is the number that actually distinguishes them.
+const char *disconnectReasonName(uint8_t r) {
+  switch (r) {
+    case 2:   return "AUTH_EXPIRE";
+    case 4:   return "ASSOC_EXPIRE";
+    case 5:   return "ASSOC_TOOMANY -- the AP is full";
+    case 6:   return "NOT_AUTHED";
+    case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE";
+    case 14:  return "MIC_FAILURE -- wrong password";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT -- wrong password, or we are not being heard";
+    case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+    case 18:  return "GROUP_CIPHER_INVALID";
+    case 19:  return "PAIRWISE_CIPHER_INVALID";
+    case 20:  return "AKMP_INVALID";
+    case 24:  return "CIPHER_SUITE_REJECTED";
+    case 200: return "BEACON_TIMEOUT -- we drifted out of range";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default:  return "see esp_wifi_types.h";
+  }
+}
+
+// Arduino's WiFi status codes, spelled out. Worth having by name: 1 and 4
+// look the same from outside and mean completely different things.
+const char *wifiStatusName(int s) {
+  switch (s) {
+    case WL_IDLE_STATUS:     return "idle";
+    case WL_NO_SSID_AVAIL:   return "SSID not seen on the air";
+    case WL_CONNECTED:       return "connected";
+    case WL_CONNECT_FAILED:  return "rejected, usually a wrong password";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED:    return "disconnected, still trying";
+    default:                 return "unknown";
+  }
+}
 
 // Reported in a fixed order so the Pi side can rely on it. BOOT is excluded:
 // it is the mode strap, not a game button.
@@ -144,13 +228,33 @@ void setup() {
   leds::begin();
   leds::setStatus(leds::Status::Booting);
 
+  const esp_reset_reason_t why = esp_reset_reason();
+  Serial.printf("[pilink] boot, last reset: %s\n", resetReasonName(why));
+
   btn::poll();
   Serial.println("[pilink] press and hold BOOT in the next 5s for local mode "
                  "(console only, radio off)");
 
   Serial.printf("[pilink] joining \"%s\"\n", WIFI_SSID);
+  WiFi.persistent(false);   // never reuse a previous boot's stored AP config
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    const uint8_t r = info.wifi_sta_disconnected.reason;
+    Serial.printf("[pilink] disconnected, reason %u (%s)\n", r, disconnectReasonName(r));
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  // Recent ESP32 cores refuse anything below WPA2 and report the AP as simply
+  // absent -- WL_NO_SSID_AVAIL for a network a scan can plainly see, which is
+  // a maddening thing to debug. NetworkManager's key-mgmt=wpa-psk with no
+  // explicit proto brings an access point up as original WPA, so accept it.
+  // The Pi side should be pinned to RSN/CCMP; this is the belt to that braces.
+  WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Transmit power is the biggest lever on peak current, and peak current is
+  // what browns out two AA cells through a boost converter. The Pi is in the
+  // same room at about -50 dBm, which is roughly 40 dB of margin, so there is
+  // plenty to give away here.
+  WiFi.setTxPower(WIFI_TX_POWER);
   leds::setStatus(leds::Status::WifiConnecting);
 
   gPeer.fromString(PI_IP);
@@ -190,11 +294,70 @@ void loop() {
     leds::poll();
     if (millis() - gLastLogMs >= 2000) {
       gLastLogMs = millis();
-      Serial.printf("[pilink] waiting for \"%s\"\n", WIFI_SSID);
+      // The status code separates the two failures that look identical from
+      // the outside: 1 means the SSID was never seen on the air, 4 usually
+      // means it was seen and the password was rejected.
+      Serial.printf("[pilink] waiting for \"%s\"  status=%d (%s)\n",
+                    WIFI_SSID, (int)WiFi.status(), wifiStatusName(WiFi.status()));
+    }
+
+    if (millis() - gLastConnectMs >= kReconnectMs) {
+      gLastConnectMs = millis();
+      gConnectAttempts++;
+
+      if (gConnectAttempts >= kRebootAfter) {
+        Serial.println("[pilink] still not on the network; restarting the badge");
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+      }
+
+      if (gConnectAttempts % kHardResetEvery == 0) {
+        Serial.printf("[pilink] attempt %u: tearing the radio down and back up\n",
+                      gConnectAttempts);
+        WiFi.disconnect(true, true);   // also erase the stored AP config
+        WiFi.mode(WIFI_OFF);
+        delay(300);
+        WiFi.mode(WIFI_STA);
+        WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+      } else {
+        WiFi.disconnect();
+      }
+
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.setTxPower(WIFI_TX_POWER);
+    }
+    // One scan, once, after giving the normal path a fair chance. Says whether
+    // the network is even on the air and what the badge's radio can actually
+    // see, which is the question you otherwise end up guessing at.
+    if (!gScanned && millis() > 12000) {
+      gScanned = true;
+      Serial.println("[pilink] scanning for visible 2.4 GHz networks...");
+      // A scan started while a connect attempt is still running comes back
+      // empty on the ESP32, which reads as "the radio is dead" when it only
+      // means "the radio was busy". Stop trying first, then scan.
+      WiFi.disconnect(false, false);
+      delay(300);
+      const int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+      if (n <= 0) {
+        Serial.println("[pilink]   nothing visible at all");
+      } else {
+        for (int i = 0; i < n; i++) {
+          const bool match = WiFi.SSID(i) == String(WIFI_SSID);
+          Serial.printf("[pilink]   %-34s ch %2d  rssi %4d  auth %d %s%s\n",
+                        WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i),
+                        (int)WiFi.encryptionType(i),
+                        WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "encrypted",
+                        match ? "   <-- this is the one we want" : "");
+        }
+      }
+      WiFi.scanDelete();
+      gLastConnectMs = 0;   // scanning drops the attempt; let the retry restart it
     }
     return;
   }
 
+  gConnectAttempts = 0;
   pollAck();
 
   const uint32_t now    = millis();
