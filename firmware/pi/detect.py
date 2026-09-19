@@ -37,6 +37,16 @@ import urllib.request
 
 DEFAULT_URL = "https://serverless.roboflow.com/infer/workflows"
 
+# Roboflow's inference server speaks the same API on the Pi itself:
+#
+#     pip install inference-cli && inference server start
+#     export RF_URL=http://localhost:9001/infer/workflows
+#
+# Same request, same response, no internet per frame and no round trip over a
+# hackathon network. It needs Docker and a one-time image pull, and inference
+# then competes with the video pipeline for the Pi's CPU rather than costing
+# nothing -- so measure it before trusting it. --bench does that.
+
 # The saved workflow (dev-f8zc3/custom-workflow-3) renders an annotated image
 # and returns only that, with no coordinates -- which cannot be drawn over live
 # video. Rather than ask anyone to edit it, this sends the same model as an
@@ -149,6 +159,11 @@ class Detector:
         body = json.dumps({
             "api_key": self.api_key,
             "specification": self.spec,
+            # Keeps the model warm between calls. Worth a lot against a local
+            # server on its first requests, and nothing at all for the frames
+            # themselves -- every frame is different, so no response is ever
+            # reused. Model caching is the only kind that helps live video.
+            "use_cache": True,
             "inputs": {"image": {"type": "base64",
                                  "value": base64.b64encode(jpeg).decode()}},
         }).encode()
@@ -212,11 +227,34 @@ def from_env(interval=0.5):
     if not key:
         return None
     return Detector(
+        url=os.environ.get("RF_URL"),
         api_key=key,
         model_id=os.environ.get("RF_MODEL", "rfdetr-nano"),
         classes=os.environ.get("RF_CLASSES", "person").split(","),
         interval=interval,
     )
+
+
+def bench(det, jpeg, rounds=5):
+    """Time the round trip. Cloud and local differ by far more than their
+    marketing does, and the answer depends on this Pi and this network."""
+    times, counts = [], []
+    for _ in range(rounds):
+        started = time.monotonic()
+        try:
+            boxes = det._infer(jpeg)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"  failed: {type(exc).__name__}: {exc}")
+            return
+        times.append((time.monotonic() - started) * 1000.0)
+        counts.append(len(boxes))
+    times.sort()
+    print(f"  {det.url}")
+    print(f"  {rounds} calls: best {times[0]:.0f} ms, median {times[len(times)//2]:.0f} ms, "
+          f"worst {times[-1]:.0f} ms")
+    print(f"  {counts[-1]} detections on the last one")
+    print(f"  that is about {1000.0 / max(times[len(times)//2], 1):.1f} inferences a second, "
+          f"while the video runs at its own rate regardless")
 
 
 if __name__ == "__main__":
@@ -226,6 +264,13 @@ if __name__ == "__main__":
         sys.exit("set RF_API_KEY first")
     if len(sys.argv) < 2:
         sys.exit(f"usage: {sys.argv[0]} <image.jpg>")
+    if "--bench" in sys.argv:
+        sys.argv.remove("--bench")
+        if len(sys.argv) < 2:
+            sys.exit(f"usage: {sys.argv[0]} --bench <image.jpg>")
+        bench(det, open(sys.argv[1], "rb").read())
+        sys.exit(0)
+
     data = open(sys.argv[1], "rb").read()
     print(f"posting {len(data)} bytes to {det.url}")
     t = time.monotonic()
