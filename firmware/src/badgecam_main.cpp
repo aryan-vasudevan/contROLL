@@ -27,6 +27,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_system.h>
+#include <Preferences.h>
 #include <string.h>
 
 #include <SPI.h>
@@ -46,6 +47,8 @@ namespace {
 SPIClass         gSpi(FSPI);
 Adafruit_ST7789  gTft(&gSpi, PIN_DISP_CS, PIN_DISP_DC, PIN_DISP_RST);
 JPEGDEC          gJpeg;
+Preferences      gPrefs;
+bool             gFullClock = false;
 
 WiFiClient gStream;
 WiFiUDP    gUdp;
@@ -208,7 +211,19 @@ void sendButtons() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.printf("[cam] boot, last reset: %d\n", (int)esp_reset_reason());
+  // Remember across boots. A badge that dies on battery cannot be watched over
+  // USB, and plugging it in to look is itself a power-on that destroys the
+  // evidence. Storing the reason means the next USB boot can report what
+  // happened on the last battery one.
+  const int why = (int)esp_reset_reason();
+  gPrefs.begin("badgecam", false);
+  const int prev = gPrefs.getInt("lastreset", -1);
+  gPrefs.putInt("lastreset", why);
+  gPrefs.end();
+  // 9 is ESP_RST_BROWNOUT, 4 is ESP_RST_PANIC.
+  Serial.printf("[cam] boot, reset now: %d, previous boot: %d%s\n", why, prev,
+                prev == 9 ? "  <-- BROWNOUT last time: the supply, not the code" :
+                prev == 4 ? "  <-- PANIC last time" : "");
 
   btn::begin();
   leds::begin();
@@ -225,9 +240,11 @@ void setup() {
   testPattern();
   Serial.printf("[cam] panel %dx%d\n", gTft.width(), gTft.height());
 
-  // Full speed: JPEG decode is entirely compute-bound and this is the single
-  // biggest factor in the frame rate.
-  setCpuFrequencyMhz(160);
+  // Associate at the low clock. The current crunch is during association --
+  // that is where the radio transmits hardest -- and the badge cannot afford
+  // to be decoding-fast and associating at the same time on two AA cells.
+  // The clock goes up once there is actually a link worth decoding for.
+  setCpuFrequencyMhz(CPU_MHZ);
   delay(RADIO_SETTLE_MS);
 
   WiFi.persistent(false);
@@ -249,6 +266,10 @@ void loop() {
   leds::poll();
 
   if (WiFi.status() != WL_CONNECTED) {
+    if (gFullClock) {
+      gFullClock = false;
+      setCpuFrequencyMhz(CPU_MHZ);   // back to the cheap clock to re-associate
+    }
     leds::setStatus(leds::Status::WifiConnecting);
     static uint32_t saidAt = 0;
     if (millis() - saidAt > 2000) {
@@ -258,6 +279,14 @@ void loop() {
       banner("no wifi", WIFI_SSID);
     }
     return;
+  }
+
+  if (!gFullClock) {
+    // Associated. Now buy the clock speed that JPEG decode needs.
+    gFullClock = true;
+    setCpuFrequencyMhz(160);
+    Serial.printf("[cam] on the network; cpu -> %u MHz for decoding\n",
+                  (unsigned)getCpuFrequencyMhz());
   }
 
   // Buttons carry on regardless of whether video is flowing.
