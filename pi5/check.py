@@ -24,6 +24,19 @@ _MARK = {OK: "\033[32m ok \033[0m", WARN: "\033[33mwarn\033[0m",
 failures = 0
 warnings = 0
 
+IS_LINUX = sys.platform.startswith("linux")
+
+# setup.sh only runs on the Pi, so off Linux the advice has to be the manual
+# commands instead. Pointing at a script that refuses to run is worse than
+# giving no advice at all.
+VENV = "~/oakenv"
+INSTALL_HINT = (
+    "./setup.sh"
+    if IS_LINUX
+    else f"python3 -m venv {VENV} && {VENV}/bin/pip install depthai opencv-python"
+)
+PYTHON_HINT = "python3" if IS_LINUX else f"{VENV}/bin/python"
+
 
 def report(status: str, title: str, detail: str = "", fix: str = "") -> None:
     global failures, warnings
@@ -79,10 +92,14 @@ in_venv = sys.prefix != sys.base_prefix
 if in_venv:
     report(OK, "Running inside a virtual environment")
 else:
-    report(WARN, "Not in a virtual environment",
-           "Raspberry Pi OS Bookworm marks the system Python as externally "
-           "managed, so pip refuses to install into it.",
-           "source ~/oakenv/bin/activate, or run setup.sh to create it")
+    detail = ("Raspberry Pi OS Bookworm marks the system Python as externally "
+              "managed, so pip refuses to install into it."
+              if IS_LINUX else
+              "Homebrew's Python is also externally managed, so a plain "
+              "pip install will be refused here too.")
+    report(WARN, "Not in a virtual environment", detail,
+           f"{INSTALL_HINT}\n"
+           f"then run this again as:  {PYTHON_HINT} check.py")
 
 # --- driver ----------------------------------------------------------------
 section("DepthAI")
@@ -94,9 +111,19 @@ try:
         report(WARN, "This is not DepthAI v3",
                f"found {dai.__version__}",
                "The code here uses the v3 API. pip install -U depthai")
-except ImportError as exc:
+except Exception as exc:
+    if "Library not loaded" in str(exc) or "image not found" in str(exc):
+        report(FAIL, "depthai is installed but broken",
+               f"{type(exc).__name__}: {str(exc)[:160]}",
+               "This is what a half-written package looks like, usually a "
+               "pip install that ran out of disk.",
+               f"Check free space with  df -h  then reinstall:\n"
+               f"rm -rf {VENV} && {INSTALL_HINT}")
+        dai = None
+        raise SystemExit(1)
     report(FAIL, "depthai not importable", str(exc),
-           "Run ./setup.sh, or: pip install depthai")
+           f"{INSTALL_HINT}\n"
+           f"then:  {PYTHON_HINT} check.py")
     dai = None
 
 try:
@@ -104,7 +131,8 @@ try:
     report(OK, f"opencv {cv2.__version__} imported")
 except ImportError as exc:
     report(FAIL, "opencv not importable", str(exc),
-           "pip install opencv-python-headless")
+           f"{INSTALL_HINT}\n"
+           f"then:  {PYTHON_HINT} check.py")
     cv2 = None
 
 # --- permissions -----------------------------------------------------------

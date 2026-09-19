@@ -24,6 +24,33 @@ you headroom for whatever else you put on the aircraft later, not frame rate.
 **Power is the real constraint, not memory.** Read the next section before you
 blame the software.
 
+## You do not need the Pi to start
+
+DepthAI ships a macOS arm64 wheel, so the camera works plugged straight into a
+Mac. Everything except `setup.sh`, the udev rule and the power checks is
+platform independent, and `check.py` skips the Linux-only parts rather than
+failing on them.
+
+```
+python3 -m venv ~/oakenv
+~/oakenv/bin/pip install depthai opencv-python
+~/oakenv/bin/python check.py
+~/oakenv/bin/python detect.py --stream
+```
+
+Note the explicit `~/oakenv/bin/python`. Running plain `python3` uses the
+system interpreter, which has none of this installed, and Homebrew's Python is
+externally managed so a plain `pip install` into it is refused.
+
+The install needs roughly 400 MB. If pip dies partway through you get a broken
+library rather than a clean failure, and the error mentions a dylib that cannot
+be loaded rather than anything about disk. `check.py` recognises that case and
+says so.
+
+So: develop the detection and streaming on a laptop, move to the Pi when you
+need it on the aircraft. The only thing you cannot test off the Pi is the USB
+power budget, which is the section below.
+
 ## The failure everyone hits first
 
 By default a Raspberry Pi 5 limits its USB ports to 600 mA in total. The OAK-1
