@@ -235,6 +235,16 @@ void setup() {
   Serial.println("[pilink] press and hold BOOT in the next 5s for local mode "
                  "(console only, radio off)");
 
+  // Slow the clock before the radio starts. Baseline draw is part of the peak
+  // that a boost converter running off two AA cells cannot supply, and the
+  // C3 takes roughly half the current at 80 MHz as at 160.
+  setCpuFrequencyMhz(CPU_MHZ);
+  Serial.printf("[pilink] cpu %u MHz\n", (unsigned)getCpuFrequencyMhz());
+
+  // Let the supply recover from boot inrush before asking it to transmit.
+  // An association attempt launched into a brownout is one that fails.
+  delay(RADIO_SETTLE_MS);
+
   Serial.printf("[pilink] joining \"%s\"\n", WIFI_SSID);
   WiFi.persistent(false);   // never reuse a previous boot's stored AP config
   WiFi.mode(WIFI_STA);
@@ -255,6 +265,7 @@ void setup() {
   // same room at about -50 dBm, which is roughly 40 dB of margin, so there is
   // plenty to give away here.
   WiFi.setTxPower(WIFI_TX_POWER);
+  WiFi.setSleep(true);   // modem sleep between packets; the default, said out loud
   leds::setStatus(leds::Status::WifiConnecting);
 
   gPeer.fromString(PI_IP);
