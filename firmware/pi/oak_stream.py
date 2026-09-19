@@ -49,8 +49,23 @@ DET_MAGIC = b"BDET"
 DEFAULT_PORT = 14557          # 14555/14556 belong to the button link
 
 
-def build_pipeline(dai, width, height, fps, quality):
-    """Camera -> hardware MJPEG encoder. Returns (pipeline, output queue)."""
+def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5):
+    """Camera -> hardware MJPEG encoder, and optionally a detector alongside.
+
+    Returns (pipeline, frame queue, detection queue or None).
+
+    The detector runs on the camera's own Myriad X, not on the Pi and not in
+    the cloud. That is the whole point: inference costs the Pi nothing, needs
+    no network, and keeps up with the frame rate instead of trailing it by a
+    few hundred milliseconds.
+
+    The network takes its own output from the camera rather than sharing the
+    encoder's. Encoding at 160x120 while the network sees whatever resolution
+    it wants means neither holds the other back, at the cost of pairing the
+    newest boxes with the newest frame rather than exactly their own. At 30
+    detections a second that is a frame of slip; the cloud path was thirty
+    times worse.
+    """
     pipeline = dai.Pipeline()
 
     cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -74,9 +89,61 @@ def build_pipeline(dai, width, height, fps, quality):
         raise RuntimeError(
             "VideoEncoder has no .out in this depthai build. Available: " + ", ".join(attrs))
 
+    det_queue = None
+    if model:
+        net = pipeline.create(dai.node.DetectionNetwork).build(
+            cam, dai.NNModelDescription(model))
+        net.setConfidenceThreshold(float(confidence))
+        try:
+            labels = list(net.getClasses() or [])
+        except Exception:
+            labels = []
+        det_queue = net.out.createOutputQueue(maxSize=2, blocking=False)
+        det_queue._labels = labels        # carried along for naming boxes
+        print(f"  detector: {model} on the camera, confidence {confidence}")
+        if labels:
+            print(f"  {len(labels)} classes, person is "
+                  f"{'present' if 'person' in [l.lower() for l in labels] else 'ABSENT'}")
+
     # maxSize 2, non-blocking: if the consumer falls behind we want the newest
     # frame, not a backlog. Latency matters more than completeness for video.
-    return pipeline, out.createOutputQueue(maxSize=2, blocking=False)
+    return pipeline, out.createOutputQueue(maxSize=2, blocking=False), det_queue
+
+
+def read_boxes(queue, width, height, wanted):
+    """Newest detections as (x, y, w, h, label, confidence) in source pixels.
+
+    Drains rather than reads one: anything behind the newest is older than the
+    frame about to be sent.
+    """
+    packet = None
+    while True:
+        try:
+            newer = queue.tryGet()
+        except Exception:
+            newer = None
+        if newer is None:
+            break
+        packet = newer
+    if packet is None:
+        return None                       # nothing new; keep what we had
+
+    labels = getattr(queue, "_labels", [])
+    boxes = []
+    for d in packet.detections:
+        try:
+            name = d.labelName
+        except Exception:
+            name = labels[d.label] if 0 <= d.label < len(labels) else str(d.label)
+        if wanted and name.lower() not in wanted:
+            continue
+        # depthai gives 0..1 normalised corners; the badge wants source pixels.
+        x = int(d.xmin * width)
+        y = int(d.ymin * height)
+        w = int((d.xmax - d.xmin) * width)
+        h = int((d.ymax - d.ymin) * height)
+        boxes.append((x, y, max(w, 1), max(h, 1), name[:15], float(d.confidence)))
+    return boxes
 
 
 def list_devices(dai):
@@ -92,7 +159,7 @@ def list_devices(dai):
 
 def save_frames(dai, args):
     """Prove the camera produces valid JPEGs, with no badge in the picture."""
-    pipeline, queue = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
+    pipeline, queue, _ = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
     with pipeline:
         pipeline.start()
         print(f"capturing {args.save} frame(s) at {args.width}x{args.height} q{args.quality}")
@@ -110,7 +177,10 @@ def save_frames(dai, args):
 
 
 def serve(dai, args):
-    pipeline, queue = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
+    wanted = {c.strip().lower() for c in args.classes.split(',') if c.strip()}
+    pipeline, queue, det_queue = build_pipeline(
+        dai, args.width, args.height, args.fps, args.quality,
+        model=args.nn, confidence=args.confidence)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -122,15 +192,19 @@ def serve(dai, args):
     print("  waiting for the badge; ctrl-c to stop")
 
     detector = None
-    if args.detect:
+    if args.detect and not args.nn:
+        # Cloud fallback, kept for when a model is wanted that the camera
+        # cannot run. Measured at 323-1485 ms a call against serverless, so
+        # boxes visibly trail anything that moves. --nn does not.
         import detect as detect_mod
         detector = detect_mod.from_env(interval=args.detect_interval)
         if detector is None:
-            print("  detection asked for but RF_API_KEY is not set; skipping")
+            print("  --detect asked for but RF_API_KEY is not set; skipping")
         else:
             detector.start()
-            print(f"  detection on, every {args.detect_interval}s, "
-                  f"out of band from the video")
+            print(f"  cloud detection every {args.detect_interval}s, out of band")
+
+    boxes = []
 
     frame_id = 0
     frames = dropped = total_bytes = 0
@@ -175,19 +249,24 @@ def serve(dai, args):
                 frames += 1
                 total_bytes += len(jpeg)
 
-                if detector is not None:
-                    # Hand the detector the frame we just sent, and ship
-                    # whatever boxes it last produced. Boxes are tiny next to a
-                    # frame, so this costs nothing measurable.
+                if det_queue is not None:
+                    # Boxes from the camera itself. read_boxes returns None when
+                    # nothing new has arrived, which means keep the last set
+                    # rather than blink them off between detections.
+                    fresh = read_boxes(det_queue, args.width, args.height, wanted)
+                    if fresh is not None:
+                        boxes = fresh
+                elif detector is not None:
                     detector.offer(jpeg)
                     boxes = detector.boxes()
-                    if boxes:
-                        blob = DET_MAGIC + struct.pack("<BH", len(boxes), frame_id)
-                        for x, y, w, h, label, conf in boxes[:16]:
-                            name = label.encode()[:15]
-                            blob += struct.pack("<hhHHBB", x, y, w, h,
-                                                int(conf * 100), len(name)) + name
-                        sock.sendto(blob, peer)
+
+                if boxes:
+                    blob = DET_MAGIC + struct.pack("<BH", len(boxes), frame_id)
+                    for x, y, w, h, label, conf in boxes[:16]:
+                        name = label.encode()[:15]
+                        blob += struct.pack("<hhHHBB", x, y, w, h,
+                                            int(conf * 100), len(name)) + name
+                    sock.sendto(blob, peer)
 
                 now = time.monotonic()
                 if now - last_report >= 5.0:
@@ -219,6 +298,13 @@ def main():
     ap.add_argument("--quality", type=int, default=70, help="MJPEG quality, 1-100")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--nn", nargs="?", const="yolov6-nano", metavar="MODEL",
+                    help="run detection ON THE CAMERA, e.g. --nn or --nn yolov6-nano. "
+                         "Needs internet once to cache the model, then never again. "
+                         "Costs the Pi nothing and keeps up with the frame rate.")
+    ap.add_argument("--classes", default="person",
+                    help="comma separated classes to keep, or empty for all")
+    ap.add_argument("--confidence", type=float, default=0.5)
     ap.add_argument("--detect", action="store_true",
                     help="run the Roboflow workflow alongside the stream and send "
                          "boxes to the badge. Needs RF_API_KEY in the environment "
