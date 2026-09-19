@@ -25,12 +25,15 @@ format against an independent reference implementation, the geometry that keeps
 the drone off the person holding the badge, the shake detector's ability to tell
 a shake from walking, and the button map checked against the KiCad board file.
 
-**Not verified, because it needs hardware nobody has wired up yet.** No badge
-has been flashed. No real flight controller has ever accepted these MAVLink
-frames. The shake threshold is tuned against synthetic motion, not a hand. And
-the A and B buttons are an inference: the board has no silkscreen naming them,
-so the D-pad was derived from switch coordinates, which is unambiguous, and A
-was taken to be the outer button of the diagonal pair.
+**The button map is confirmed.** Every role was cross-checked against the
+board's own silkscreen, which is drawn as vector outlines rather than text and
+so is invisible to a search of the board file. A is the outer button of the
+diagonal pair, B the inner one, and the two buttons below them are HOME and
+START; START is the one wired to the ESP32-C3 boot pin.
+
+**Not verified, because it needs hardware nobody has wired up yet.** No real
+flight controller has ever accepted these MAVLink frames, and the shake
+threshold is tuned against synthetic motion rather than a hand.
 
 **This has never flown.** Treat every number in `firmware/include/config.h` as a
 starting point.
@@ -51,12 +54,16 @@ pio device monitor       # serial console at 115200
 ./tests/run.sh           # host tests, no hardware needed
 ```
 
-**The most useful first step is flashing a badge and holding BOOT while it
-resets.** That lands in a diagnostics mode which transmits nothing, so it is
-safe with a battery in the drone, and it prints button names to the console as
-you press them. It answers the A/B question above, tells you whether the
-accelerometer responds, and lets you feel out the shake threshold. It costs one
-USB-C cable and no other hardware.
+**The most useful first step is flashing a badge, powering it up, and then
+pressing and holding BOOT within five seconds.** That lands in a diagnostics
+mode which transmits nothing, so it is safe with a battery in the drone, and it
+prints button names to the console as you press them. Do not hold BOOT while
+resetting: SW10 shorts GPIO9 to ground, GPIO9 is the ESP32-C3's boot strapping
+pin, and the ROM would go into serial download mode instead of running this.
+
+Diagnostics answers the A/B question above, tells you whether the accelerometer
+responds, and lets you feel out the shake threshold. It costs one USB-C cable
+and no other hardware.
 
 ## What the drone needs
 

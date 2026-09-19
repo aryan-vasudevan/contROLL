@@ -31,28 +31,52 @@ eight bits MSB-first gives this order:
 |---|---|---|---|
 | 7 | `SW_HPM` | SW6 | A |
 | 6 | `BTN_7` | SW5 | B |
-| 5 | `BTN_6` | SW7 | SELECT |
+| 5 | `BTN_6` | SW7 | SELECT, silkscreened HOME |
 | 4 | `BTN_5` | SW8 | down |
-| 3 | `BTN_1` | SW11 | slide switch |
-| 2 | `BTN_2` | SW2 | up |
-| 1 | `BTN_3` | SW3 | right |
-| 0 | `BTN_4` | SW4 | left |
+| 3 | `BTN_4` | SW4 | left |
+| 2 | `BTN_3` | SW3 | right |
+| 1 | `BTN_2` | SW2 | up |
+| 0 | `BTN_1` | SW11 | slide switch |
+
+`BTN_1` through `BTN_7` sit on bits 0 through 6 in order, with `SW_HPM` on
+bit 7. Pins 11/12/13/14 of the register are `D0/D1/D2/D3`; assuming the reverse
+mirrors the D-pad, which is how this was found on a real badge.
 
 The accelerometer is an SC7A20 at I2C address 0x19. Its CS pin is pulled high,
 which selects I2C, and its SDO pin is pulled high, which picks 0x19 over 0x18.
 Both were read off the board.
 
-### One thing you should verify on real hardware
+### Verified against the silkscreen
 
-This board has no silkscreen naming the buttons, so the D-pad and A/B roles come
-from where the switches physically sit. SW2, SW4, SW3 and SW8 form a clean cross,
-which is unambiguous. A and B are the diagonal pair to its right, and A is taken
-to be the outer one.
+The roles were originally derived from where the switches physically sit, then
+confirmed against the board's own silkscreen. The labels are drawn as vector
+outlines rather than text objects, so searching the board file for them finds
+nothing; rendering the `F.SilkS` artwork shows them plainly:
 
-Hold the BOOT button while powering up to enter diagnostics. Nothing is
-transmitted in that mode, so it is safe with a battery in the drone. Press each
-button and read the names off the serial console. If A and B are swapped on your
-badge, swap `BIT_A` and `BIT_B` at the top of `src/buttons.cpp`.
+| Switch | Silkscreen |
+|---|---|
+| SW2 / SW4 / SW3 / SW8 | UP / LEFT / RIGHT / DOWN, with arrows |
+| SW6 | **A**, the outer button of the diagonal pair |
+| SW5 | **B**, the inner one |
+| SW7 | **HOME** (a house icon) -- this firmware calls it SELECT |
+| SW10 | **START** (a play icon) -- this is the BOOT button |
+| SW1 | OFF / ON |
+
+The coordinate-derived map matched the silkscreen on every button, so nothing
+needs swapping.
+
+Power the badge up, then press and hold BOOT within five seconds, to enter
+diagnostics. Nothing is transmitted in that mode, so it is safe with a battery
+in the drone. Press each button and read the names off the serial console.
+
+BOOT is deliberately not sampled at reset. SW10 shorts GPIO9 to ground (R31
+pulls it to 3V3, both read off the board) and GPIO9 is the ESP32-C3's boot
+strapping pin, so holding BOOT through a reset puts the ROM into serial
+download mode and the firmware never runs. The symptom is a serial port that
+enumerates, prints a ROM banner, and then goes quiet.
+
+If A and B come out swapped on your badge, swap `BIT_A` and `BIT_B` at the top
+of `src/buttons.cpp`.
 
 ## What the drone needs
 
@@ -208,8 +232,10 @@ sources rather than reimplementing it, so they track edits to the real thing.
 USB-C goes straight to the C3's native USB peripheral, so the console is USB CDC
 and needs no adapter.
 
-If the LEDs stay dark but the badge is clearly running, check slide switch SW1.
-It gates the 5 V boost converter that powers the LED chain.
+Slide switch SW1 (OFF/ON) gates only the battery path into the 5 V boost. U12
+OR-es that boost output with USB VBUS, and everything on the badge including the
+3V3 LDO hangs off the result, so on USB the badge runs with SW1 either way and
+on battery alone it has to be ON.
 
 ## Layout
 

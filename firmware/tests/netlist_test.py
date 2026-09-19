@@ -42,7 +42,14 @@ while True:
 
 # 74HC165 input pin -> parallel data bit. QH presents D7 straight after a load,
 # so reading eight bits MSB-first walks D7 down to D0.
-PIN_TO_D = {'14':0, '13':1, '12':2, '11':3, '3':4, '4':5, '5':6, '6':7}
+#
+# The low-nibble half of this table was WRONG until it was checked against a
+# real badge: pins 11/12/13/14 are D0/D1/D2/D3, not D3/D2/D1/D0. With the old
+# table this test agreed with the firmware because both derived the map the
+# same wrong way, so it passed while the hardware disagreed. That is the
+# failure mode to keep in mind here -- this test proves the firmware matches
+# the board file, not that either matches the physical part.
+PIN_TO_D = {'11':0, '12':1, '13':2, '14':3, '3':4, '4':5, '5':6, '6':7}
 bit_to_net = {PIN_TO_D[pad]: net
               for net, pads in net2pads.items()
               for ref, pad in pads if ref == 'U8' and pad in PIN_TO_D}

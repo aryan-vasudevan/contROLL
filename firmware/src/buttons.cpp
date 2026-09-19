@@ -5,14 +5,23 @@ namespace btn {
 namespace {
 
 // Bit position within the byte clocked out of the shift register, MSB first.
-constexpr uint8_t BIT_A      = 7;  // SW_HPM, SW6
-constexpr uint8_t BIT_B      = 6;  // BTN_7,  SW5
-constexpr uint8_t BIT_SELECT = 5;  // BTN_6,  SW7
-constexpr uint8_t BIT_DOWN   = 4;  // BTN_5,  SW8
-constexpr uint8_t BIT_SLIDE  = 3;  // BTN_1,  SW11
-constexpr uint8_t BIT_UP     = 2;  // BTN_2,  SW2
-constexpr uint8_t BIT_RIGHT  = 1;  // BTN_3,  SW3
-constexpr uint8_t BIT_LEFT   = 0;  // BTN_4,  SW4
+//
+// VERIFIED ON A REAL BADGE. An earlier version of this had the low nibble
+// reversed, from assuming the 74HC165's pins 11/12/13/14 are D3/D2/D1/D0. On
+// this part they are D0/D1/D2/D3, so the four D-pad bits came out mirrored:
+// pressing UP reported RIGHT, RIGHT reported UP, and LEFT reported SLIDE.
+// DOWN, A, B and SELECT were unaffected, which is why it looked half-working.
+//
+// The corrected order is the obvious one the net names were hinting at all
+// along: BTN_1..BTN_7 sit on bits 0..6, and SW_HPM on bit 7.
+constexpr uint8_t BIT_A      = 7;  // SW_HPM, SW6   silkscreen A
+constexpr uint8_t BIT_B      = 6;  // BTN_7,  SW5   silkscreen B
+constexpr uint8_t BIT_SELECT = 5;  // BTN_6,  SW7   silkscreen HOME
+constexpr uint8_t BIT_DOWN   = 4;  // BTN_5,  SW8   silkscreen DOWN
+constexpr uint8_t BIT_LEFT   = 3;  // BTN_4,  SW4   silkscreen LEFT
+constexpr uint8_t BIT_RIGHT  = 2;  // BTN_3,  SW3   silkscreen RIGHT
+constexpr uint8_t BIT_UP     = 1;  // BTN_2,  SW2   silkscreen UP
+constexpr uint8_t BIT_SLIDE  = 0;  // BTN_1,  SW11  unlabelled slide switch
 
 constexpr uint8_t kBit[COUNT] = {
   BIT_UP, BIT_DOWN, BIT_LEFT, BIT_RIGHT,
