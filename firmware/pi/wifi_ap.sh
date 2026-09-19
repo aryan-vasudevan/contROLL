@@ -76,10 +76,18 @@ nmcli connection add type wifi ifname "$AP_IFACE" con-name "$AP_CONN" \
 
 # Band bg is 2.4 GHz. This is not optional: the badge's ESP32-C3 has no 5 GHz
 # radio, so an access point on 5 GHz is invisible to it.
+# key-mgmt=wpa-psk on its own brings the access point up as ORIGINAL WPA with
+# TKIP, which an ESP32-C3 negotiates badly: it associates once in a while and
+# otherwise reports AUTH_EXPIRE, looking for all the world like a wrong
+# password. Pinning proto/pairwise/group to RSN and CCMP makes it WPA2 with
+# AES, which the badge handles natively -- and TKIP is broken anyway.
 nmcli connection modify "$AP_CONN" \
   802-11-wireless.mode ap \
   802-11-wireless.band bg \
   wifi-sec.key-mgmt wpa-psk \
+  wifi-sec.proto rsn \
+  wifi-sec.pairwise ccmp \
+  wifi-sec.group ccmp \
   wifi-sec.psk "$AP_PASS" \
   ipv4.method shared \
   ipv4.addresses "$AP_ADDR/$AP_CIDR" \

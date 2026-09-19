@@ -90,7 +90,13 @@ ssid=__SSID__
 band=bg
 
 [wifi-security]
+# proto/pairwise/group pin this to WPA2 with AES. key-mgmt=wpa-psk alone comes
+# up as original WPA with TKIP, which an ESP32-C3 negotiates badly enough to
+# look like a wrong password.
 key-mgmt=wpa-psk
+proto=rsn
+pairwise=ccmp
+group=ccmp
 psk=__PASS__
 
 [ipv4]
