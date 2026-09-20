@@ -89,7 +89,7 @@ def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5)
         raise RuntimeError(
             "VideoEncoder has no .out in this depthai build. Available: " + ", ".join(attrs))
 
-    det_queue = None
+    det_queue, labels = None, []
     if model:
         net = pipeline.create(dai.node.DetectionNetwork).build(
             cam, dai.NNModelDescription(model))
@@ -99,7 +99,6 @@ def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5)
         except Exception:
             labels = []
         det_queue = net.out.createOutputQueue(maxSize=2, blocking=False)
-        det_queue._labels = labels        # carried along for naming boxes
         print(f"  detector: {model} on the camera, confidence {confidence}")
         if labels:
             print(f"  {len(labels)} classes, person is "
@@ -107,10 +106,10 @@ def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5)
 
     # maxSize 2, non-blocking: if the consumer falls behind we want the newest
     # frame, not a backlog. Latency matters more than completeness for video.
-    return pipeline, out.createOutputQueue(maxSize=2, blocking=False), det_queue
+    return pipeline, out.createOutputQueue(maxSize=2, blocking=False), det_queue, labels
 
 
-def read_boxes(queue, width, height, wanted):
+def read_boxes(queue, labels, width, height, wanted):
     """Newest detections as (x, y, w, h, label, confidence) in source pixels.
 
     Drains rather than reads one: anything behind the newest is older than the
@@ -128,7 +127,6 @@ def read_boxes(queue, width, height, wanted):
     if packet is None:
         return None                       # nothing new; keep what we had
 
-    labels = getattr(queue, "_labels", [])
     boxes = []
     for d in packet.detections:
         try:
@@ -159,7 +157,7 @@ def list_devices(dai):
 
 def save_frames(dai, args):
     """Prove the camera produces valid JPEGs, with no badge in the picture."""
-    pipeline, queue, _ = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
+    pipeline, queue, _, _ = build_pipeline(dai, args.width, args.height, args.fps, args.quality)
     with pipeline:
         pipeline.start()
         print(f"capturing {args.save} frame(s) at {args.width}x{args.height} q{args.quality}")
@@ -178,7 +176,7 @@ def save_frames(dai, args):
 
 def serve(dai, args):
     wanted = {c.strip().lower() for c in args.classes.split(',') if c.strip()}
-    pipeline, queue, det_queue = build_pipeline(
+    pipeline, queue, det_queue, labels = build_pipeline(
         dai, args.width, args.height, args.fps, args.quality,
         model=args.nn, confidence=args.confidence)
 
@@ -253,7 +251,7 @@ def serve(dai, args):
                     # Boxes from the camera itself. read_boxes returns None when
                     # nothing new has arrived, which means keep the last set
                     # rather than blink them off between detections.
-                    fresh = read_boxes(det_queue, args.width, args.height, wanted)
+                    fresh = read_boxes(det_queue, labels, args.width, args.height, wanted)
                     if fresh is not None:
                         boxes = fresh
                 elif detector is not None:
