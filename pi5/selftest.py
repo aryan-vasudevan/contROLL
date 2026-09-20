@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from detect import draw                       # noqa: E402
 from mjpeg import MjpegServer                 # noqa: E402
 from oakcam import Detection, Frame, OakCamera, OakCameraError, list_devices  # noqa: E402
+from automode import AUTO, MANUAL, Box, ModeSwitch, follow  # noqa: E402
 
 failures = 0
 
@@ -185,6 +186,88 @@ b = MjpegServer(port=8102, host="127.0.0.1")
 b.start()
 b.stop()
 check(True, "port rebinds immediately after a restart")
+
+# --- nfc mode switching ----------------------------------------------------
+section("nfc mode switching")
+
+TAG = "04BD224C9E6180"
+sw = ModeSwitch(TAG)
+check(sw.mode == MANUAL, "starts in manual, every time")
+
+# The badge counts taps across a Pi restart, so the first count seen is
+# history, not an event.
+check(sw.on_packet(TAG, 7, 100.0) is False, "first packet adopts the count, does not switch")
+check(sw.mode == MANUAL, "still manual after adopting")
+
+check(sw.on_packet(TAG, 8, 101.0) is True, "a new tap switches")
+check(sw.mode == AUTO, "manual -> auto")
+
+# The badge repeats the same count 20 times a second.
+check(sw.on_packet(TAG, 8, 101.1) is False, "the same count again does nothing")
+check(sw.mode == AUTO, "repeats do not toggle back")
+
+check(sw.on_packet(TAG, 9, 103.0) is True, "the next tap switches back")
+check(sw.mode == MANUAL, "auto -> manual")
+
+# Any tag reads; only one tag counts.
+sw2 = ModeSwitch(TAG)
+sw2.on_packet(TAG, 1, 0.0)
+check(sw2.on_packet("DEADBEEF", 2, 1.0) is False, "an unknown tag is ignored")
+check(sw2.mode == MANUAL, "an unknown tag does not switch")
+check(sw2.rejected == "DEADBEEF", "the unknown tag is reported")
+
+# Case and separators differ between readers; the badge sends bare uppercase.
+sw3 = ModeSwitch("04:bd:22:4c:9e:61:80")
+sw3.on_packet(TAG, 1, 0.0)
+check(sw3.on_packet(TAG.lower(), 2, 1.0) is True, "uid compare ignores case and colons")
+
+# A packet with no nfc fields at all is the old protocol.
+sw4 = ModeSwitch(TAG)
+check(sw4.on_packet(None, None, 0.0) is False, "a packet with no nfc fields is inert")
+
+sw5 = ModeSwitch(TAG, cooldown=1.5)
+sw5.on_packet(TAG, 1, 0.0)
+sw5.on_packet(TAG, 2, 10.0)
+check(sw5.mode == AUTO, "switched once")
+check(sw5.on_packet(TAG, 3, 10.2) is False, "a second tap inside the cooldown is dropped")
+check(sw5.mode == AUTO, "cooldown holds the mode")
+
+sw6 = ModeSwitch(TAG)
+sw6.on_packet(TAG, 1, 0.0)
+sw6.on_packet(TAG, 2, 10.0)
+check(sw6.force_manual() is True, "HOME forces manual")
+check(sw6.mode == MANUAL, "and the mode really changed")
+check(sw6.force_manual() is False, "forcing manual twice reports no change")
+
+# --- the follow law --------------------------------------------------------
+section("follow law")
+
+centred = [Box("person", 0.50, 0.5, 0.25)]
+check(follow(centred, 0.0) == (0.0, 0.0), "centred and at distance: no drive")
+
+left_of_centre = follow([Box("person", 0.20, 0.5, 0.25)], 0.0)
+check(left_of_centre[0] < left_of_centre[1], "a subject to the left steers left")
+
+right_of_centre = follow([Box("person", 0.80, 0.5, 0.25)], 0.0)
+check(right_of_centre[0] > right_of_centre[1], "a subject to the right steers right")
+
+far = follow([Box("person", 0.5, 0.5, 0.05)], 0.0)
+check(far[0] > 0 and far[1] > 0, "a small (far) subject drives forward")
+
+near = follow([Box("person", 0.5, 0.5, 0.60)], 0.0)
+check(near[0] < 0 and near[1] < 0, "a large (near) subject backs off")
+
+check(follow(centred, 5.0) == (0.0, 0.0), "stale detections stop the car")
+check(follow([], 0.0) == (0.0, 0.0), "no detections at all stop the car")
+check(follow([Box("backpack", 0.2, 0.5, 0.3)], 0.0) == (0.0, 0.0),
+      "a non-target class is not followed")
+
+biggest = follow([Box("person", 0.9, 0.5, 0.05), Box("person", 0.1, 0.5, 0.40)], 0.0)
+check(biggest[0] < biggest[1], "the nearest of two people is the one followed")
+
+for box in (Box("person", 0.0, 0.5, 0.9), Box("person", 1.0, 0.5, 0.01)):
+    l, r = follow([box], 0.0)
+    check(abs(l) <= 0.451 and abs(r) <= 0.451, f"speed stays capped at cx={box.cx}")
 
 # --- summary ---------------------------------------------------------------
 print()

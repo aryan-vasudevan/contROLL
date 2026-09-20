@@ -29,6 +29,7 @@
 #include <esp_system.h>
 #include <Preferences.h>
 #include <string.h>
+#include <Wire.h>
 
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -39,6 +40,7 @@
 #include "config.h"
 #include "buttons.h"
 #include "leds.h"
+#include "nfc.h"
 
 namespace {
 
@@ -52,6 +54,19 @@ bool             gFullClock = false;
 
 WiFiUDP    gVideo;
 WiFiUDP    gUdp;
+
+// --- NFC -------------------------------------------------------------------
+// gNfcSeq counts presentations, not polls: it goes up once when a tag arrives
+// and not again until that tag has been away for kNfcGapMs. The Pi switches
+// mode on a change in this number, which makes the switch idempotent -- a
+// dropped packet cannot lose the event, because every later packet still
+// carries the new count.
+char     gNfcUid[2 * nfc::kMaxUid + 1] = {0};
+uint32_t gNfcSeq        = 0;
+uint32_t gNfcLastSeen   = 0;
+uint32_t gLastNfcPollMs = 0;
+constexpr uint32_t kNfcPollMs = 100;    // 10 Hz; ~5 ms each when nothing is there
+constexpr uint32_t kNfcGapMs  = 1500;   // same tag within this is still one tap
 IPAddress  gPeer;
 
 // Biggest JPEG we will accept. A 320x240 frame at quality 70 runs 10-16 KB;
@@ -357,15 +372,50 @@ void sendButtons() {
     if (held[0]) strncat(held, " ", sizeof(held) - strlen(held) - 1);
     strncat(held, btn::name(b), sizeof(held) - strlen(held) - 1);
   }
-  char line[192];
+  // Appended, not inserted, and only once a tag has ever been read. The Pi's
+  // parser anchors on the prefix, so a badge that has never met a tag still
+  // speaks exactly the protocol the Pi already understood.
+  char tail[48] = {0};
+  if (gNfcSeq) {
+    snprintf(tail, sizeof(tail), " nfc=%s nfcseq=%lu",
+             gNfcUid, (unsigned long)gNfcSeq);
+  }
+  char line[240];
   const int n = snprintf(line, sizeof(line),
-                         "BADGE1 seq=%lu ms=%lu raw=0x%02X down=[%s]",
+                         "BADGE1 seq=%lu ms=%lu raw=0x%02X down=[%s]%s",
                          (unsigned long)++gSeq, (unsigned long)millis(),
-                         btn::rawRegister(), held);
+                         btn::rawRegister(), held, tail);
   if (n <= 0) return;
   gUdp.beginPacket(gPeer, PI_UDP_PORT);
   gUdp.write(reinterpret_cast<const uint8_t *>(line), n);
   gUdp.endPacket();
+}
+
+// Turns "a tag is in the field" into "a tag arrived". Called from the video
+// loop, so what matters is the cost of an empty poll: about 5 ms, ten times a
+// second, against a loop that is otherwise spending everything on JPEG decode.
+void serviceNfc() {
+  if (!nfc::present()) return;
+  if (millis() - gLastNfcPollMs < kNfcPollMs) return;
+  gLastNfcPollMs = millis();
+
+  nfc::Tag tag;
+  if (!nfc::poll(tag)) return;
+
+  char uid[sizeof(gNfcUid)];
+  nfc::formatUid(tag, uid, sizeof(uid));
+
+  // Holding the badge against the tag reads it on every poll. Only the first
+  // of those is a tap; the rest are the same tap still going on.
+  if (strcmp(uid, gNfcUid) == 0 && millis() - gNfcLastSeen < kNfcGapMs) {
+    gNfcLastSeen = millis();
+    return;
+  }
+  strncpy(gNfcUid, uid, sizeof(gNfcUid) - 1);
+  gNfcUid[sizeof(gNfcUid) - 1] = '\0';
+  gNfcLastSeen = millis();
+  gNfcSeq++;
+  Serial.printf("[cam] NFC %s  (tap %lu)\n", gNfcUid, (unsigned long)gNfcSeq);
 }
 
 }  // namespace
@@ -390,6 +440,16 @@ void setup() {
   btn::begin();
   leds::begin();
   leds::setStatus(leds::Status::Booting);
+
+  // Shared bus with the accelerometer, and the board carries its own 4k7
+  // pull-ups (R34/R36), so internal ones stay off.
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  if (nfc::begin()) {
+    Serial.printf("[cam] NFC reader at 0x%02X, version 0x%02X\n",
+                  nfc::address(), nfc::version());
+  } else {
+    Serial.println("[cam] no NFC reader answered 0x28-0x2F; mode switching off");
+  }
 
   // Panel first, before anything that can fail for network reasons.
   // The panel is 240x320 in its native portrait orientation; rotation 1 puts
@@ -430,6 +490,7 @@ void setup() {
 void loop() {
   btn::poll();
   leds::poll();
+  serviceNfc();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (gFullClock) {
