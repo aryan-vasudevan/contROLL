@@ -394,17 +394,18 @@ uint32_t gLastDiagMs = 0;
 //   U7.26  10k to GND  (R10)  -> address strap 0
 //   U7.27  10k to GND  (R11)  -> address strap 0
 //
-// Under the standard MFRC522 mapping (7-bit address 0b0101 followed by
-// ADR_2..ADR_0) those straps give 0x29. Treat that as a prediction, not a
-// fact: the schematic symbol came from an EasyEDA conversion and names these
-// pins A0/A1/D1-D6 rather than the datasheet's own names, so the pin-function
-// mapping is the one link in the chain that was not verified. The scan settles
-// it either way -- whatever address answers is the real one.
+// The address is 0x26, per Hack the North's own HAL guide for this board.
+// Worth recording how that went: the straps above were read correctly off the
+// PCB, but turning them into an address needs the MFRC522's pin-function
+// names, and the schematic symbol is an EasyEDA conversion that calls them
+// A0/A1/D1-D6 rather than the datasheet's ADR_n. Reading 0x29 out of that was
+// a guess dressed as arithmetic. The scan below reports whatever actually
+// answers, which is the only reason the mistake was cheap.
 const char *i2cWhat(uint8_t addr) {
   if (addr == ACCEL_I2C_ADDR)       return "SC7A20 accelerometer (U2)";
   if (addr == 0x18)                 return "SC7A20 at the SDO-low address; check R4";
-  if (addr == 0x29)                 return "MFRC522 NFC reader (U7), the predicted address";
-  if (addr >= 0x28 && addr <= 0x2F) return "MFRC522 NFC reader (U7), different address strap";
+  if (addr == 0x26)                 return "MFRC522 NFC reader (U7)";
+  if (addr >= 0x24 && addr <= 0x2F) return "MFRC522 NFC reader (U7), unexpected address strap";
   return "unexpected; nothing on this badge should answer here";
 }
 
