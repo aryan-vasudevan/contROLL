@@ -49,7 +49,8 @@ DET_MAGIC = b"BDET"
 DEFAULT_PORT = 14557          # 14555/14556 belong to the button link
 
 
-def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5):
+def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5,
+                   nn_fps=None):
     """Camera -> hardware MJPEG encoder, and optionally a detector alongside.
 
     Returns (pipeline, frame queue, detection queue or None).
@@ -91,15 +92,23 @@ def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5)
 
     det_queue, labels = None, []
     if model:
+        # fps throttles how often the Myriad X runs the network, and with it
+        # how much current the camera draws. An OAK that crashes and
+        # reconnects in a loop under load is almost always a power problem --
+        # a Pi 5 allows 600 mA total across its USB ports unless it is on a
+        # 5 V/5 A supply with usb_max_current_enable=1 -- and detections do not
+        # need to be as frequent as frames to look right.
         net = pipeline.create(dai.node.DetectionNetwork).build(
-            cam, dai.NNModelDescription(model))
+            cam, dai.NNModelDescription(model),
+            **({"fps": float(nn_fps)} if nn_fps else {}))
         net.setConfidenceThreshold(float(confidence))
         try:
             labels = list(net.getClasses() or [])
         except Exception:
             labels = []
         det_queue = net.out.createOutputQueue(maxSize=2, blocking=False)
-        print(f"  detector: {model} on the camera, confidence {confidence}")
+        print(f"  detector: {model} on the camera, confidence {confidence}"
+              + (f", capped at {nn_fps} fps" if nn_fps else ""))
         if labels:
             print(f"  {len(labels)} classes, person is "
                   f"{'present' if 'person' in [l.lower() for l in labels] else 'ABSENT'}")
@@ -178,7 +187,7 @@ def serve(dai, args):
     wanted = {c.strip().lower() for c in args.classes.split(',') if c.strip()}
     pipeline, queue, det_queue, labels = build_pipeline(
         dai, args.width, args.height, args.fps, args.quality,
-        model=args.nn, confidence=args.confidence)
+        model=args.nn, confidence=args.confidence, nn_fps=args.nn_fps)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -300,6 +309,11 @@ def main():
                     help="run detection ON THE CAMERA, e.g. --nn or --nn yolov6-nano. "
                          "Needs internet once to cache the model, then never again. "
                          "Costs the Pi nothing and keeps up with the frame rate.")
+    ap.add_argument("--nn-fps", type=float, default=5.0, metavar="FPS",
+                    help="how often the camera runs the network (default 5). "
+                         "Lower it if the OAK crashes and reconnects in a loop: "
+                         "that is a power problem, and this is the one lever "
+                         "that reduces its draw. 0 for unthrottled.")
     ap.add_argument("--classes", default="person",
                     help="comma separated classes to keep, or empty for all")
     ap.add_argument("--confidence", type=float, default=0.5)
