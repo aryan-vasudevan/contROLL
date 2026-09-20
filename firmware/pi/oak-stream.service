@@ -1,0 +1,30 @@
+[Unit]
+# Runs the camera stream from boot. Started by hand in an SSH session it dies
+# with the session, which looks from the badge like a network fault and is not
+# one -- that cost a debugging round.
+Description=OAK-1 MJPEG stream for the badge
+Documentation=https://github.com/aryan-vasudevan/drone-hacking
+After=network.target NetworkManager.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/home/pi/oak/bin/python -u /home/pi/oak_stream.py
+
+# The OAK is on USB and can take a moment to be claimable after a reboot, and
+# the badge retries forever anyway, so restarting is always the right answer.
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+# Needs raw USB access to the Myriad X, so it cannot be locked down as hard as
+# the button listener. PrivateTmp is still free.
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

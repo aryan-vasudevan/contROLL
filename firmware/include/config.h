@@ -70,7 +70,38 @@
 // a firmware crash and is not one. WIFI_POWER_11dBm still leaves tens of dB
 // of margin against a Pi in the same room. Raise it if the link gets flaky at
 // distance, and expect to pay for it in battery life.
-#define WIFI_TX_POWER     WIFI_POWER_19_5dBm
+// Confirmed on hardware: the badge associates fine on USB and cannot associate
+// at all on two AA cells. Association needs sustained full-power transmit, and
+// the MT3608 boost cannot deliver those current spikes from tired cells -- the
+// chip browns out before the handshake finishes. Transmit power is the largest
+// lever on peak current, and against a Pi measured at -50 dBm in the same room
+// there are tens of dB to give away.
+//
+// Raise it only if the link gets flaky at distance, and expect to pay for it in
+// battery life. Options, in descending draw: WIFI_POWER_19_5dBm, _17dBm,
+// _15dBm, _13dBm, _11dBm, _8_5dBm, _7dBm, _5dBm, _2dBm.
+#define WIFI_TX_POWER     WIFI_POWER_11dBm
+
+// CPU clock. The radio needs at least 80 MHz, and the C3 draws roughly half
+// as much there as at 160. Nothing in the button link is compute-bound, so
+// this is close to free.
+//
+// RAISE THIS TO 160 before doing anything with the camera: JPEG decode is
+// entirely compute-bound and halving the clock halves the frame rate.
+#define CPU_MHZ           80
+
+// Settle time before the radio comes up. Two AA cells through a boost
+// converter sag under the inrush of everything starting at once, and an
+// association attempt launched into that brownout is one that fails.
+#define RADIO_SETTLE_MS   400
+
+// The camera is mounted upside down on the car, so the picture is rotated in
+// the badge rather than on the camera. It costs nothing here: the upscaling
+// pass already touches every pixel, and reversing a row-major buffer end to
+// end flips both axes at once. Doing it on the camera would mean another ISP
+// pass and more latency. Set to 0 if the camera is ever mounted the right way
+// up.
+#define CAM_ROTATE_180    1
 
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
