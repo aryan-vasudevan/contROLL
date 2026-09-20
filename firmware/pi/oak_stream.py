@@ -220,6 +220,18 @@ def serve(dai, args):
 
     with pipeline:
         pipeline.start()
+
+        # The negotiated link speed, not the port it is plugged into. A USB-C
+        # cable carrying only the USB 2.0 pairs sits happily in a SuperSpeed
+        # port and negotiates high-speed, and nothing looks wrong until the
+        # camera is asked to do real work and starts browning out.
+        try:
+            speed = pipeline.getDefaultDevice().getUsbSpeed()
+            bad = "SUPER" not in str(speed).upper()
+            print(f"  usb link: {speed}"
+                  + ("   <-- USB 2.0. That is the cable, not the port." if bad else ""))
+        except Exception as exc:
+            print(f"  usb link: could not read ({type(exc).__name__})")
         try:
             while True:
                 # One request, one frame. Over UDP this is also the only way we
