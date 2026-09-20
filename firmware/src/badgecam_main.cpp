@@ -38,6 +38,7 @@
 #include "badge_pins.h"
 #include "config.h"
 #include "buttons.h"
+#include "imu.h"
 #include "leds.h"
 
 namespace {
@@ -62,8 +63,20 @@ constexpr uint16_t kStreamPort   = 14557;
 constexpr uint16_t kVideoLocalPort = 14558;
 constexpr size_t   kChunk        = 1400;
 constexpr int      kMaxBoxes     = 16;
-constexpr uint32_t kReconnectMs  = 3000;
-constexpr uint32_t kStallMs      = 4000;
+// Short, deliberately. The frame request is one tiny datagram; on a radio
+// that is now AP + hotspot client at once, it gets lost far more often than
+// it did, and every loss used to freeze the picture for the full 4 s the
+// original values allowed. Re-asking is nearly free -- worst case a
+// duplicate frame -- so recovery is priced at under a second.
+constexpr uint32_t kReconnectMs  = 400;
+constexpr uint32_t kStallMs      = 600;
+// Only after THIS long does the badge admit the link is down on screen.
+// Re-asking is silent and cheap and happens at kStallMs; painting the
+// "waiting" banner is neither -- it blanks the whole panel and turns the
+// LEDs blue, and firing it on every sub-second hiccup made the badge flash
+// black/blue every few seconds, which read as broken when it was merely
+// impatient.
+constexpr uint32_t kOutageMs     = 3500;
 
 uint8_t  gFrame[kMaxFrame];
 
@@ -201,15 +214,107 @@ uint32_t gAsmMask    = 0;      // bit per chunk received; 32 chunks is 44 KB
 size_t   gAsmLen     = 0;
 bool     gAsmActive  = false;
 
-// Detections, drawn over the video. They arrive out of band and much more
-// slowly than frames -- inference is a network round trip -- so they are held
+// Detections, drawn over the video. They arrive out of band and a little
+// behind the frames -- inference is a network round trip -- so they are held
 // and redrawn on every frame until replaced or they go stale. Boxes that no
 // longer match what the camera sees are worse than no boxes.
-struct Box { int16_t x, y; uint16_t w, h; uint8_t conf; char label[16]; };
+//
+// `id` is a tracker id from the Pi and is the whole reason a target can be
+// selected: it names the same person from one frame to the next, where a
+// position in the list does not.
+// --- detection packet ------------------------------------------------------
+// [detparse] Everything between these markers is compiled and tested on a
+// host by tests/detpacket_test.cpp. It is pulled out verbatim by extract.py,
+// so it must not touch Arduino APIs or globals.
+//
+// The handoff's complaint about the old overlay was exact and worth not
+// repeating: "a Python script packed boxes and unpacked them with a Python
+// re-implementation of the C++ parsing, and the values matched. That proves
+// the Python agrees with itself." So this is the real parser, and the test
+// feeds it bytes the real packer produced.
+
+struct DetBox { int16_t x, y; uint16_t w, h; uint8_t conf; uint8_t id; char label[16]; };
+
+// Returns the number of boxes parsed, or -1 if this is not a detection packet.
+//
+//     "BDT2" u8 count  u16 frame_id  u16 img_w  u16 img_h
+//     then count x:  s16 x  s16 y  u16 w  u16 h  u8 conf  u8 id  u8 len  <label>
+//
+// Every read is bounds-checked against n. These bytes come off a UDP socket,
+// so the length fields are attacker-controlled in the same sense that any
+// network input is: a corrupt one must truncate the parse, never index past
+// the buffer.
+int parseDetections(const unsigned char *pkt, int n, DetBox *out, int maxBoxes,
+                    uint16_t *imgW, uint16_t *imgH) {
+  constexpr int kHeader = 11;      // magic 4 + count 1 + frame 2 + w 2 + h 2
+  constexpr int kFixed  = 11;      // x 2 + y 2 + w 2 + h 2 + conf 1 + id 1 + len 1
+  if (n < kHeader) return -1;
+  if (pkt[0] != 'B' || pkt[1] != 'D' || pkt[2] != 'T' || pkt[3] != '2') return -1;
+
+  int count = pkt[4];
+  if (count > maxBoxes) count = maxBoxes;
+  if (imgW) *imgW = (uint16_t)pkt[7]  | ((uint16_t)pkt[8]  << 8);
+  if (imgH) *imgH = (uint16_t)pkt[9]  | ((uint16_t)pkt[10] << 8);
+
+  int off = kHeader, parsed = 0;
+  while (parsed < count && off + kFixed <= n) {
+    DetBox &b = out[parsed];
+    b.x    = (int16_t)((uint16_t)pkt[off]     | ((uint16_t)pkt[off + 1] << 8));
+    b.y    = (int16_t)((uint16_t)pkt[off + 2] | ((uint16_t)pkt[off + 3] << 8));
+    b.w    = (uint16_t)pkt[off + 4] | ((uint16_t)pkt[off + 5] << 8);
+    b.h    = (uint16_t)pkt[off + 6] | ((uint16_t)pkt[off + 7] << 8);
+    b.conf = pkt[off + 8];
+    b.id   = pkt[off + 9];
+    const int len = pkt[off + 10];
+    off += kFixed;
+    // A length that runs off the end means the datagram was truncated. Stop
+    // with what we have rather than reading whatever follows in memory.
+    if (off + len > n) break;
+    int copy = len;
+    if (copy > (int)sizeof(b.label) - 1) copy = (int)sizeof(b.label) - 1;
+    for (int i = 0; i < copy; i++) b.label[i] = (char)pkt[off + i];
+    b.label[copy] = 0;
+    off += len;
+    parsed++;
+  }
+  return parsed;
+}
+// [/detparse]
+
+// One declaration, shared with the parser, so the two cannot drift apart.
+using Box = DetBox;
 Box      gBoxes[kMaxBoxes];
 int      gBoxCount   = 0;
+uint16_t gSrcW = 0, gSrcH = 0;      // what the coordinates are relative to
 uint32_t gBoxesAtMs  = 0;
 constexpr uint32_t kBoxStaleMs = 2000;
+
+// The target the car is being asked to drive at. 0 means none, which is why
+// the Pi never allocates id 0.
+uint8_t  gSelected   = 0;
+bool     gAuto       = false;
+
+// HOME press bookkeeping: under the threshold it is a selection tap, past it
+// it is the stop the Pi has always known.
+uint32_t gSelDownMs  = 0;
+constexpr uint32_t kSelHoldMs = 600;
+bool     gOutageShown = false;
+
+// How long a selected id may be absent before the selection is abandoned.
+// Long enough to ride out an uplink stall, short enough that the yellow does
+// not migrate to a stranger who later gets the recycled id.
+uint32_t gSelMissingMs = 0;
+constexpr uint32_t kSelGraceMs = 2500;
+
+// Shake, recording, and the horn.
+//
+// imu::shakeDetected() is true on exactly one poll, and the badge sends at
+// 20 Hz at best -- so the event has to be latched here or it is lost between
+// packets. Cleared once it has actually gone out on the wire.
+bool     gShake      = false;
+bool     gRecording  = false;
+bool     gHonk       = false;
+uint32_t gShakeAtMs  = 0;
 
 void requestFrame() {
   gVideo.beginPacket(gPeer, kStreamPort);
@@ -225,28 +330,17 @@ bool pumpVideo() {
 
   while ((size = gVideo.parsePacket()) > 0) {
     const int n = gVideo.read(pkt, sizeof(pkt));
-    if (n >= 7 && memcmp(pkt, "BDET", 4) == 0) {
-      int count = pkt[4];
-      if (count > kMaxBoxes) count = kMaxBoxes;
-      int off = 7, parsed = 0;
-      while (parsed < count && off + 10 <= n) {
-        Box &b = gBoxes[parsed];
-        b.x = (int16_t)((uint16_t)pkt[off] | ((uint16_t)pkt[off + 1] << 8));
-        b.y = (int16_t)((uint16_t)pkt[off + 2] | ((uint16_t)pkt[off + 3] << 8));
-        b.w = (uint16_t)pkt[off + 4] | ((uint16_t)pkt[off + 5] << 8);
-        b.h = (uint16_t)pkt[off + 6] | ((uint16_t)pkt[off + 7] << 8);
-        b.conf = pkt[off + 8];
-        const int len = pkt[off + 9];
-        off += 10;
-        if (len < 0 || off + len > n) break;
-        const int copy = min(len, (int)sizeof(b.label) - 1);
-        memcpy(b.label, pkt + off, copy);
-        b.label[copy] = 0;
-        off += len;
-        parsed++;
-      }
-      gBoxCount  = parsed;
+    const int boxes = parseDetections(pkt, n, gBoxes, kMaxBoxes, &gSrcW, &gSrcH);
+    if (boxes >= 0) {
+      gBoxCount  = boxes;
       gBoxesAtMs = millis();
+      // The selection belongs to the OPERATOR, not to the detector. It used
+      // to be dropped when the id went missing -- first instantly, then with
+      // a grace period -- and either way the user watched their choice
+      // evaporate because a phone link hiccupped. No more: HOME, START and
+      // the arrows are the only things that change a selection. A missing
+      // target is the Pi's safety problem (it stops the car); it is not a
+      // reason to forget what the user asked for.
       continue;
     }
     if (n < 10 || memcmp(pkt, "BJPF", 4) != 0) continue;
@@ -281,10 +375,17 @@ bool pumpVideo() {
 }
 
 // Boxes come in source-image pixels, so they scale with the picture.
+//
+// The selected target is drawn differently rather than merely labelled: at
+// 320x240 with several people in frame, a colour change is readable at arm's
+// length and a small "*" is not.
 void drawBoxes() {
   if (gBoxCount == 0 || millis() - gBoxesAtMs > kBoxStaleMs) return;
   for (int i = 0; i < gBoxCount; i++) {
     const Box &b = gBoxes[i];
+    const bool chosen = (b.id != 0 && b.id == gSelected);
+    const uint16_t tint = chosen ? (gAuto ? ST77XX_RED : ST77XX_YELLOW)
+                                 : ST77XX_GREEN;
 #if CAM_ROTATE_180
     const int sx = gImgW - b.x - (int)b.w, sy = gImgH - b.y - (int)b.h;
 #else
@@ -293,15 +394,170 @@ void drawBoxes() {
     const int x = sx * gScale + gOffsetX;
     const int y = sy * gScale + gOffsetY;
     const int w = b.w * gScale, h = b.h * gScale;
-    gTft.drawRect(x, y, w, h, ST77XX_GREEN);
-    gTft.drawRect(x - 1, y - 1, w + 2, h + 2, ST77XX_GREEN);   // 2px, more legible
+    gTft.drawRect(x, y, w, h, tint);
+    gTft.drawRect(x - 1, y - 1, w + 2, h + 2, tint);   // 2px, more legible
+    if (chosen) {
+      gTft.drawRect(x - 2, y - 2, w + 4, h + 4, tint); // 3px for the target
+    }
 
     // Label sits above the box, or inside it when the box is against the top.
     const int ty = (y >= 10) ? y - 9 : y + 2;
     gTft.setTextSize(1);
-    gTft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+    gTft.setTextColor(tint, ST77XX_BLACK);
     gTft.setCursor(x + 1, ty);
     gTft.printf("%s %u%%", b.label, (unsigned)b.conf);
+  }
+}
+
+// A single status line along the bottom. Small, but it is the only feedback
+// that says whether the badge thinks it is driving the car or aiming it, and
+// getting that wrong with a moving vehicle is the expensive kind of confusion.
+void drawHud() {
+  const int y = gTft.height() - 9;
+  gTft.setTextSize(1);
+  gTft.setTextColor(gAuto ? ST77XX_RED : ST77XX_WHITE, ST77XX_BLACK);
+  gTft.setCursor(2, y);
+  if (gAuto) {
+    gTft.printf("CHASE #%u   START stop", (unsigned)gSelected);
+  } else if (gSelected) {
+    gTft.printf("TARGET #%u  START go ", (unsigned)gSelected);
+  } else if (gBoxCount > 0) {
+    gTft.printf("%d seen  HOME picks   ", gBoxCount);
+  } else {
+    gTft.print("manual              ");
+  }
+
+  // Recording and a recent shake get their own corner, so they are legible
+  // whatever the chase is doing.
+  gTft.setCursor(gTft.width() - 64, y);
+  if (gRecording) {
+    gTft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+    gTft.print(" REC");
+  } else if (millis() - gShakeAtMs < 700) {
+    gTft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    gTft.print("HONK");
+  } else {
+    gTft.setTextColor(ST77XX_BLACK, ST77XX_BLACK);
+    gTft.print("    ");
+  }
+}
+
+// --- target selection ------------------------------------------------------
+//
+// B is the chord key, because it is already the "be careful" button (crawl)
+// and nothing that follows should ever happen by accident:
+//
+//     HOME, tapped     step through the detections (the chosen one is YELLOW)
+//     HOME, held       stop, exactly as before -- see below
+//     START            drive to the yellow one; press again to stop driving
+//     B + LEFT/RIGHT   also steps through them, as before
+//     B + A            engage or cancel the chase
+//     A, tapped        start / stop recording (uploads when it stops)
+//     B, tapped        honk -- a random sound effect on the car's speaker
+//     B + UP           also toggles recording, as before
+//     B + DOWN         also honks
+//     shake the badge  honk, without needing a free hand
+//     anything else    manual driving, and that always wins
+//
+// HOME does two jobs split by duration: a tap (under 600 ms) picks the next
+// target, a hold is the deliberate-stop latch it has always been. The split
+// lives here on the badge: sendButtons only reports HOME to the Pi once the
+// hold passes the threshold, so a tap never so much as twitches the motors,
+// and the Pi's stop logic is untouched.
+//
+// Selection lives on the badge rather than the Pi so that what is highlighted
+// on the panel and what the car is chasing cannot disagree -- there is one
+// copy of the decision and it is the one the operator can see.
+void pickTarget(int step) {
+  if (gBoxCount == 0) { gSelected = 0; gAuto = false; return; }
+  int at = -1;
+  for (int i = 0; i < gBoxCount; i++) {
+    if (gBoxes[i].id == gSelected) { at = i; break; }
+  }
+  at = (at < 0) ? 0 : (at + step + gBoxCount) % gBoxCount;
+  gSelected = gBoxes[at].id;
+}
+
+void pollSelection() {
+  // Edge-triggered: holding a button steps once, not thirty times a second.
+  static bool wasLeft = false, wasRight = false, wasA = false;
+  static bool wasUp = false, wasDown = false;
+  static bool wasSel = false;
+  const bool chord = btn::down(btn::B);
+  const bool left  = chord && btn::down(btn::LEFT);
+  const bool right = chord && btn::down(btn::RIGHT);
+  const bool a     = chord && btn::down(btn::A);
+  const bool up    = chord && btn::down(btn::UP);
+  const bool down  = chord && btn::down(btn::DOWN);
+
+  if (left && !wasLeft)   pickTarget(-1);
+  if (right && !wasRight) pickTarget(+1);
+  if (a && !wasA) {
+    if (gAuto)            gAuto = false;
+    else if (gSelected)   gAuto = true;
+  }
+  if (up && !wasUp)     gRecording = !gRecording;
+  if (down && !wasDown) gHonk = true;
+
+  // Bare taps of A and B, distinguished from their driving jobs (boost and
+  // crawl) by being short and clean: nothing else pressed while they were
+  // down. Holding A with UP still boosts exactly as it always has.
+  static bool wasABare = false, wasBBare = false;
+  static bool aDirty = false, bDirty = false;
+  static uint32_t aDownAt = 0, bDownAt = 0;
+  const bool aNow = btn::down(btn::A);
+  const bool bNow = btn::down(btn::B);
+  const bool anyDir = btn::down(btn::UP) || btn::down(btn::DOWN) ||
+                      btn::down(btn::LEFT) || btn::down(btn::RIGHT);
+  if (aNow && !wasABare) { aDownAt = millis(); aDirty = false; }
+  if (bNow && !wasBBare) { bDownAt = millis(); bDirty = false; }
+  if (aNow && anyDir) aDirty = true;                       // it was a boost
+  if (bNow && (anyDir || btn::down(btn::A))) bDirty = true; // crawl or chord
+  if (!aNow && wasABare && !aDirty && millis() - aDownAt < 500)
+    gRecording = !gRecording;
+  if (!bNow && wasBBare && !bDirty && millis() - bDownAt < 500)
+    gHonk = true;
+  wasABare = aNow; wasBBare = bNow;
+
+  // HOME: tap to pick the next person, hold to stop (reported by
+  // sendButtons only after the hold threshold).
+  const bool sel = btn::down(btn::SELECT);
+  if (sel && !wasSel)  gSelDownMs = millis();
+  if (!sel && wasSel && millis() - gSelDownMs < kSelHoldMs) pickTarget(+1);
+  wasSel = sel;
+
+  // START: go. One press drives at the yellow target, another stands down.
+  // btn::BOOT is SW10 on GPIO9 -- the boot strapping pin, which is exactly
+  // why it is read like any other button at runtime but must never be held
+  // through a reset (that is the ROM's download-mode strap, handoff par.4).
+  static bool wasStart = false;
+  const bool start = btn::down(btn::BOOT);
+  if (start && !wasStart) {
+    if (gAuto)          gAuto = false;
+    else if (gSelected) gAuto = true;
+  }
+  wasStart = start;
+
+  wasLeft = left; wasRight = right; wasA = a;
+  wasUp = up; wasDown = down;
+
+  // Shaking the badge honks. The detector needs several threshold crossings
+  // inside a window, which is what separates a deliberate shake from the badge
+  // swinging on a lanyard while somebody walks -- see imu.h. It is on a
+  // cooldown, so leaning on it cannot machine-gun the horn.
+  if (imu::present() && imu::shakeDetected()) {
+    gShake = true;
+    gHonk  = true;
+    gShakeAtMs = millis();
+  }
+
+  // Any bare direction is a human taking the wheel. The Pi enforces this too
+  // -- it must, since the badge could be switched off mid-chase -- but doing
+  // it here as well means the panel stops claiming CHASE the instant the
+  // driver overrides, rather than a round trip later.
+  if (!chord && (btn::down(btn::UP) || btn::down(btn::DOWN) ||
+                 btn::down(btn::LEFT) || btn::down(btn::RIGHT))) {
+    gAuto = false;
   }
 }
 
@@ -336,6 +592,7 @@ bool decodeFrame() {
   gJpeg.close();
 
   drawBoxes();
+  drawHud();
 
   gFrames++;
   gBytes += len;
@@ -354,14 +611,28 @@ void sendButtons() {
   char held[96] = {0};
   for (btn::Id b : kReported) {
     if (!btn::down(b)) continue;
+    // A short HOME press is a selection tap and stays on the badge; only a
+    // real hold reaches the Pi, where it means stop.
+    if (b == btn::SELECT && millis() - gSelDownMs < kSelHoldMs) continue;
     if (held[0]) strncat(held, " ", sizeof(held) - strlen(held) - 1);
     strncat(held, btn::name(b), sizeof(held) - strlen(held) - 1);
   }
   char line[192];
+  // sel/auto are appended after down=[...] rather than inserted, so a Pi
+  // running the older badge_listen.py -- whose regex stops at the closing
+  // bracket -- keeps working untouched.
   const int n = snprintf(line, sizeof(line),
-                         "BADGE1 seq=%lu ms=%lu raw=0x%02X down=[%s]",
+                         "BADGE1 seq=%lu ms=%lu raw=0x%02X down=[%s] sel=%u auto=%d "
+                         "shake=%d rec=%d honk=%d",
                          (unsigned long)++gSeq, (unsigned long)millis(),
-                         btn::rawRegister(), held);
+                         btn::rawRegister(), held,
+                         (unsigned)gSelected, gAuto ? 1 : 0,
+                         gShake ? 1 : 0, gRecording ? 1 : 0, gHonk ? 1 : 0);
+  // One-shot events, cleared the moment they are on the wire. Level state
+  // (rec) is not cleared: the Pi should be able to recover it from any packet,
+  // not just the one where it changed.
+  gShake = false;
+  gHonk  = false;
   if (n <= 0) return;
   gUdp.beginPacket(gPeer, PI_UDP_PORT);
   gUdp.write(reinterpret_cast<const uint8_t *>(line), n);
@@ -391,13 +662,32 @@ void setup() {
   leds::begin();
   leds::setStatus(leds::Status::Booting);
 
+  // The accelerometer shares GPIO 5/6 with the NFC reader. The driver has
+  // existed and been host-tested since the drone firmware; this is the first
+  // build that compiles it into the camera badge. A badge without one still
+  // works -- present() is false and shaking simply does nothing.
+  if (imu::begin()) {
+    Serial.printf("[cam] accelerometer at 0x19, WHO_AM_I 0x%02X; shake to honk\n",
+                  imu::whoAmI());
+  } else {
+    Serial.println("[cam] no accelerometer; shake-to-honk disabled");
+  }
+
   // Panel first, before anything that can fail for network reasons.
   // The panel is 240x320 in its native portrait orientation; rotation 1 puts
   // it in the 320x240 landscape the camera feed is sized for.
   gSpi.begin(PIN_DISP_SCLK, -1 /* no MISO */, PIN_DISP_MOSI, PIN_DISP_CS);
   gTft.init(240, 320);
   gTft.setSPISpeed(80000000);   // 40 MHz was costing ~15 ms a frame
-  gTft.setRotation(1);
+  // Rotation 3, not 1. Found on hardware, 2026-09-20: with rotation 1 the
+  // panel's origin lands at the physical bottom-right of the badge as held,
+  // so every glyph came out upside down. The old firmware masked this by
+  // flipping the *video* in software (CAM_ROTATE_180), which fixed the
+  // picture and quietly left all text inverted -- unnoticed because nothing
+  // drew text over live video until the overlay did. Rotation 3 turns the
+  // whole coordinate system instead, so video, boxes and text agree, and the
+  // software flip (a full reversal of every decoded strip) is gone.
+  gTft.setRotation(3);
   gTft.fillScreen(ST77XX_BLACK);
   testPattern();
   Serial.printf("[cam] panel %dx%d\n", gTft.width(), gTft.height());
@@ -430,6 +720,8 @@ void setup() {
 void loop() {
   btn::poll();
   leds::poll();
+  imu::poll();
+  pollSelection();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (gFullClock) {
@@ -459,8 +751,22 @@ void loop() {
   }
 
   // Buttons carry on regardless of whether video is flowing.
-  if (millis() - gLastBtnMs >= (uint32_t)(1000 / (btn::anyDown() ? BADGE_SEND_HZ
-                                                                 : BADGE_IDLE_HZ))) {
+  //
+  // gAuto counts as activity even with nothing held, and it has to. The Pi
+  // cuts the motors after 200 ms of silence, while an idle badge sends every
+  // 500 ms -- so a chase with no button pressed would be stopped by the
+  // failsafe three times a second. Autonomy is exactly the case where nobody
+  // is touching the badge, so the heartbeat has to come from the mode rather
+  // than from a finger.
+  // A recent shake counts as activity too. The spin it triggers runs on the
+  // Pi with nobody touching a button, and at the idle 2 Hz heartbeat the
+  // Pi's 200 ms failsafe fires BETWEEN packets -- which cut every spin off
+  // at half a revolution and looked like a duration bug. Fast heartbeats for
+  // a few seconds keep the failsafe fed for the whole 360.
+  const bool spinActive = millis() - gShakeAtMs < 3000;
+  if (millis() - gLastBtnMs >= (uint32_t)(1000 / ((btn::anyDown() || gAuto || spinActive)
+                                                  ? BADGE_SEND_HZ
+                                                  : BADGE_IDLE_HZ))) {
     gLastBtnMs = millis();
     sendButtons();
   }
@@ -470,13 +776,17 @@ void loop() {
   // lost request as well as a Pi that restarted.
   if (millis() - gLastFrameMs > kStallMs && millis() - gLastTryMs > kReconnectMs) {
     gLastTryMs = millis();
-    Serial.printf("[cam] no frames; asking %s:%u again\n", PI_IP, kStreamPort);
-    banner("waiting for video", PI_IP);
-    requestFrame();
-    leds::setStatus(leds::Status::LinkWaiting);
+    requestFrame();          // silent: a lost request costs a re-ask, not a blank
+    if (millis() - gLastFrameMs > kOutageMs && !gOutageShown) {
+      gOutageShown = true;   // once per outage, not once per retry
+      Serial.printf("[cam] no frames; asking %s:%u again\n", PI_IP, kStreamPort);
+      banner("waiting for video", PI_IP);
+      leds::setStatus(leds::Status::LinkWaiting);
+    }
   }
 
   if (pumpVideo() && decodeFrame()) {
+    gOutageShown = false;
     leds::setStatus(btn::anyDown() ? leds::Status::Flying : leds::Status::Disarmed);
     requestFrame();   // ask for the next now that this one is on the panel
   }

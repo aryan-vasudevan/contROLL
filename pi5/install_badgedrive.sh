@@ -31,12 +31,12 @@ if [[ "${1:-}" == "--undo" ]]; then
 fi
 
 [[ -n "$HOME_DIR" ]]                   || die "no such user: $USER_NAME"
-for f in badgedrive.py drive.py "$UNIT.service"; do
+for f in badgedrive.py drive.py chase.py honk.py "$UNIT.service"; do
   [[ -f "$HERE/$f" ]] || die "$f is not next to this script"
 done
 
 say "Installing"
-for f in badgedrive.py drive.py; do
+for f in badgedrive.py drive.py chase.py honk.py; do
   if [[ "$HERE/$f" != "$HOME_DIR/$f" ]]; then
     install -o "$USER_NAME" -g "$USER_NAME" -m 755 "$HERE/$f" "$HOME_DIR/$f"
     echo "    copied $f"

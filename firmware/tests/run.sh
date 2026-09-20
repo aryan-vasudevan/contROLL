@@ -41,5 +41,44 @@ echo "=== button map vs the board file ==="
 python3 tests/netlist_test.py || fail=1
 
 echo
+echo "=== detection packet: the badge's parser against the Pi's packer ==="
+# The handoff's §7 complaint was that the overlay's "verified wire format" was
+# Python checked against Python. This compiles the firmware's own parser and
+# feeds it bytes the real packer produced, with the address sanitizer on so a
+# read past the buffer fails here rather than rebooting a badge.
+python3 tests/extract.py src/badgecam_main.cpp '// [detparse]' '// [/detparse]' "$BUILD/detparse.inc"
+cp tests/detpacket_test.cpp "$BUILD/"
+( cd "$BUILD" && $CXX $FLAGS -fsanitize=address,undefined -I. detpacket_test.cpp -o dettest ) || fail=1
+python3 tests/detpacket_gen.py "$BUILD"
+if ( cd "$BUILD" && ./dettest packets.txt > got.txt ); then
+  if diff -u "$BUILD/expect.txt" "$BUILD/got.txt" > "$BUILD/det.diff"; then
+    echo "  ok   $(wc -l < "$BUILD/expect.txt" | tr -d ' ') packets parsed back to the values that went in"
+  else
+    echo "  FAIL the C++ parser did not recover what the Python packer sent:"
+    sed -n '1,40p' "$BUILD/det.diff"
+    fail=1
+  fi
+else
+  echo "  FAIL the parser crashed or the sanitizer tripped"
+  fail=1
+fi
+
+echo
+echo "=== detection tracker ==="
+python3 tests/track_test.py || fail=1
+
+echo
+echo "=== chase controller ==="
+python3 tests/chase_test.py || fail=1
+
+echo
+echo "=== autopilot end to end ==="
+# Runs the real badgedrive.py and speaks to it over real sockets. Slower than
+# the others and worth it: the unit tests cover the arithmetic, this covers
+# the wiring, and the wiring is where a detection packet once looked like a
+# dead link and cut the motors.
+python3 tests/autopilot_test.py || fail=1
+
+echo
 if [ "$fail" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail

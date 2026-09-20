@@ -32,16 +32,24 @@ fi
 
 [[ -n "$HOME_DIR" ]]                 || die "no such user: $TARGET_USER"
 [[ -x "$VENV/bin/python" ]]          || die "no depthai venv at $VENV (run install_oak.sh first)"
-[[ -f "$HERE/oak_stream.py" ]]       || die "oak_stream.py is not next to this script"
 [[ -f "$HERE/$UNIT.service" ]]       || die "$UNIT.service is not next to this script"
+
+# detect.py and track.py are imported at runtime, not at startup, so leaving
+# them behind gives a service that boots fine and then dies the first time
+# anyone asks for a detection. Copy all three or none.
+MODULES=(oak_stream.py detect.py track.py record.py)
+for f in "${MODULES[@]}"; do
+  [[ -f "$HERE/$f" ]] || die "$f is not next to this script"
+done
 
 say "Installing the camera stream"
 
-if [[ "$HERE/oak_stream.py" != "$HOME_DIR/oak_stream.py" ]]; then
-  install -o "$TARGET_USER" -g "$TARGET_USER" -m 755 \
-          "$HERE/oak_stream.py" "$HOME_DIR/oak_stream.py"
-  echo "    copied oak_stream.py to $HOME_DIR"
-fi
+for f in "${MODULES[@]}"; do
+  if [[ "$HERE/$f" != "$HOME_DIR/$f" ]]; then
+    install -o "$TARGET_USER" -g "$TARGET_USER" -m 755 "$HERE/$f" "$HOME_DIR/$f"
+    echo "    copied $f to $HOME_DIR"
+  fi
+done
 
 # Prove the camera is there before wiring this to boot. A unit that crash-loops
 # against absent hardware is worse than no unit.

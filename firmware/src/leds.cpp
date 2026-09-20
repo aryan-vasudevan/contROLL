@@ -46,19 +46,40 @@ void blink(uint8_t r, uint8_t g, uint8_t b, uint16_t phase, uint16_t period) {
   fill((phase % period) < period / 2 ? rgb(r, g, b) : 0);
 }
 
+// The Solana palette, one colour per LED, crawling around the ring. This is
+// the badge's ambient look for the Best Use of Badge track -- the ring spins
+// these five continuously whenever nothing needs urgent attention.
+constexpr uint8_t kSolana[][3] = {
+    {153,  69, 255},   // purple  #9945FF
+    { 20, 241, 149},   // light green #14F195
+    {  0, 200, 200},   // teal
+    { 60, 120, 255},   // blue
+    {255,  80, 200},   // pink
+};
+constexpr int kSolanaN = sizeof(kSolana) / sizeof(kSolana[0]);
+
+void solanaSnake(uint16_t phase) {
+  // The palette walks the ring: each LED shows a colour one step behind its
+  // neighbour, and the whole pattern rotates one LED every few frames.
+  const int shift = (phase / 5) % LED_COUNT;
+  for (int i = 0; i < LED_COUNT; i++) {
+    const uint8_t *c = kSolana[(i + shift) % kSolanaN];
+    // dim the tail so it reads as a snake with a head, not a static rainbow
+    const int d = (i + LED_COUNT - shift) % LED_COUNT;
+    const uint8_t k = d == 0 ? 255 : (d < 3 ? 140 : 70);
+    gStrip.setPixelColor(i, rgb((uint16_t)c[0] * k / 255,
+                                (uint16_t)c[1] * k / 255,
+                                (uint16_t)c[2] * k / 255));
+  }
+}
+
 void render(Status s, uint16_t phase) {
   switch (s) {
-    case Status::Booting:        chase(120, 120, 120, phase); break;
-    case Status::WifiConnecting: chase(0, 40, 255, phase);    break;
-    case Status::LinkWaiting:    breathe(0, 40, 255, phase);  break;
+    // Only genuinely urgent states may interrupt the snake.
     case Status::LinkLost:       blink(255, 0, 0, phase, 20); break;
-    case Status::Disarmed:       fill(rgb(0, 60, 0));         break;
-    case Status::Armed:          fill(rgb(255, 0, 0));        break;
-    case Status::Flying:         chase(0, 255, 60, phase);    break;
-    case Status::ComePending:    blink(255, 140, 0, phase, 10); break;
-    case Status::ComeActive:     chase(255, 0, 200, phase);   break;
-    case Status::BeaconSet:      fill(rgb(0, 220, 220));      break;
     case Status::Rejected:       blink(255, 0, 0, phase, 8);  break;
+    case Status::Armed:          fill(rgb(255, 0, 0));        break;
+    default:                     solanaSnake(phase);          break;
   }
 }
 

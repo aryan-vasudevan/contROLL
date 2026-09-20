@@ -45,8 +45,47 @@ MAGIC = b"BJPF"
 # losing the whole frame if any one fragment goes missing, and some of those
 # fragments would be lost on exactly the weak link this is meant to survive.
 CHUNK = 1400
-DET_MAGIC = b"BDET"
+
+# Detections. The magic is BDT2, not BDET, because the layout changed: every
+# box now carries a track id so the badge can select one and the car can chase
+# it, and the header carries the source dimensions so a consumer does not have
+# to decode the JPEG to know what the coordinates are relative to.
+#
+# Bumping the magic rather than adding a field is the point. A badge running
+# the old firmware ignores BDT2 outright and shows video with no boxes, which
+# is obvious and harmless. Had the magic stayed BDET it would have parsed the
+# new layout with the old field offsets and drawn boxes in the wrong places --
+# a bug that looks like bad detection rather than a version mismatch.
+#
+#     "BDT2" u8 count  u16 frame_id  u16 img_w  u16 img_h
+#     then count x:  s16 x  s16 y  u16 w  u16 h  u8 conf  u8 id  u8 len  <label>
+DET_MAGIC = b"BDT2"
+DET_HEADER = "<BHHH"
+DET_BOX = "<hhHHBBB"
+
 DEFAULT_PORT = 14557          # 14555/14556 belong to the button link
+
+# Where badgedrive.py listens for boxes, so it can drive at the one the badge
+# has selected. Loopback: the autopilot runs on this same Pi, and the only
+# thing that ever needs to reach it is this process.
+AUTOPILOT_ADDR = ("127.0.0.1", 14559)
+
+
+def control_command(msg):
+    """The control command in a datagram, or None if it is a frame request.
+
+    Split out to be testable, because getting it wrong is not subtle: the
+    sender of a frame request becomes the video destination, so a control
+    packet misread as a request would point the whole stream at whichever
+    process sent it and leave the badge with a blank screen.
+
+    "C:" is the marker. A frame request is "R", and note that "REC1" also
+    begins with R -- which is exactly why the prefix is checked first and why
+    the commands are not bare words.
+    """
+    if not msg.startswith(b"C:"):
+        return None
+    return msg[2:].strip()
 
 
 def build_pipeline(dai, width, height, fps, quality, model=None, confidence=0.5,
@@ -123,6 +162,11 @@ def read_boxes(queue, labels, width, height, wanted):
 
     Drains rather than reads one: anything behind the newest is older than the
     frame about to be sent.
+
+    These come back without ids -- the camera reports what it sees, not what it
+    saw last time -- so the caller runs them through the same Tracker the cloud
+    path uses. Both detectors then produce identical box tuples and everything
+    downstream stops caring which one is running.
     """
     packet = None
     while True:
@@ -198,23 +242,56 @@ def serve(dai, args):
     print(f"  {args.width}x{args.height} @ {args.fps} fps, MJPEG quality {args.quality}")
     print("  waiting for the badge; ctrl-c to stop")
 
+    from track import Tracker
+
     detector = None
+    # The camera's own detections arrive anonymous; the cloud detector does its
+    # own tracking internally. Giving the on-camera path a Tracker here means
+    # both produce boxes with stable ids, and the badge and the autopilot never
+    # learn which detector is running.
+    cam_tracker = Tracker() if args.nn else None
+    cam_seq = 0
+
     if args.detect and not args.nn:
-        # Cloud fallback, kept for when a model is wanted that the camera
-        # cannot run. Measured at 323-1485 ms a call against serverless, so
-        # boxes visibly trail anything that moves. --nn does not.
+        # Not a fallback any more. Measured against serverless on a 160x120
+        # frame: 3.6 fps one call at a time, 36.6 fps with eight in flight.
+        # The badge shows 18.8, so this keeps up with every frame with room
+        # to spare -- see the note at the top of detect.py for why the old
+        # "the cloud can only manage 3 fps" conclusion was wrong.
         import detect as detect_mod
-        detector = detect_mod.from_env(interval=args.detect_interval)
+        detector = detect_mod.from_env(workers=args.detect_workers,
+                                       interval=args.detect_interval)
         if detector is None:
             print("  --detect asked for but RF_API_KEY is not set; skipping")
         else:
             detector.start()
-            print(f"  cloud detection every {args.detect_interval}s, out of band")
+            print(f"  cloud detection: {detector.workers} requests in flight to "
+                  f"{detector.url}")
+            if args.detect_interval:
+                print(f"  throttled to one frame every {args.detect_interval}s")
+            else:
+                print("  every frame is inferred on; drops only when all "
+                      "workers are busy")
+
+    # Boxes also go to the autopilot, so the car can drive at the one the badge
+    # selected. Same packet, same coordinates: one producer, two consumers, and
+    # no chance of the badge highlighting one target while the car chases
+    # another.
+    auto_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    auto_addr = (args.autopilot_host, args.autopilot_port)
+    if args.autopilot_port:
+        print(f"  boxes also to the autopilot at {auto_addr[0]}:{auto_addr[1]}")
+
+    # Recording is toggled by the badge, which reaches this process through
+    # badgedrive.py -- the badge itself only ever speaks to the button port.
+    from record import Recorder
+    recorder = Recorder(directory=args.record_dir)
 
     boxes = []
 
     frame_id = 0
     frames = dropped = total_bytes = 0
+    last_calls = last_drops = 0
     last_report = time.monotonic()
     peer = None
 
@@ -238,7 +315,25 @@ def serve(dai, args):
                 # learn where the badge is, and it doubles as the signal that it
                 # is still alive and keeping up.
                 try:
-                    _, peer = sock.recvfrom(64)
+                    msg, sender = sock.recvfrom(64)
+                    # Control packets share this socket but must NOT become the
+                    # video destination: badgedrive.py sends them from the Pi
+                    # itself, and treating one as a frame request would redirect
+                    # the whole stream to loopback and blank the badge.
+                    cmd = control_command(msg)
+                    if cmd is not None:
+                        if cmd in (b"REC1", b"REC0"):
+                            want = cmd == b"REC1"
+                            if want and not recorder.active():
+                                print(f"  recording to {recorder.start()}.mjpeg")
+                            elif not want and recorder.active():
+                                done = recorder.stop()
+                                print(f"  recorded {done['frames']} frames, "
+                                      f"{done['dropped']} dropped, "
+                                      f"{done['megabytes']:.1f} MB, "
+                                      f"{done['fps']:.1f} fps -> {done['path']}.mjpeg")
+                        continue
+                    peer = sender
                 except socket.timeout:
                     try:
                         queue.tryGet()      # keep the camera's queue current
@@ -267,6 +362,9 @@ def serve(dai, args):
 
                 frames += 1
                 total_bytes += len(jpeg)
+                # Offered after the badge has its copy, and non-blocking, so a
+                # slow SD card costs the recording rather than the live feed.
+                recorder.offer(jpeg, boxes)
 
                 if det_queue is not None:
                     # Boxes from the camera itself. read_boxes returns None when
@@ -274,30 +372,65 @@ def serve(dai, args):
                     # rather than blink them off between detections.
                     fresh = read_boxes(det_queue, labels, args.width, args.height, wanted)
                     if fresh is not None:
-                        boxes = fresh
+                        cam_seq += 1
+                        boxes = cam_tracker.update(fresh, seq=cam_seq)
+                    else:
+                        boxes = cam_tracker.current()
                 elif detector is not None:
+                    # Offer every frame. The pool drops it if all workers are
+                    # busy, which is the backpressure: better to skip a frame
+                    # than to queue one that will be answered about a view the
+                    # car has already driven past.
                     detector.offer(jpeg)
                     boxes = detector.boxes()
 
-                if boxes:
-                    blob = DET_MAGIC + struct.pack("<BH", len(boxes), frame_id)
-                    for x, y, w, h, label, conf in boxes[:16]:
+                # Sent even when the list is empty, and that matters. "No
+                # detections" and "the packet went missing" look identical
+                # otherwise, so both ends would sit on boxes for their whole
+                # stale timeout after the last person left the frame -- the
+                # badge drawing a ghost, and the car driving at it. Eleven
+                # bytes a frame buys an unambiguous answer.
+                if det_queue is not None or detector is not None:
+                    blob = DET_MAGIC + struct.pack(DET_HEADER, min(len(boxes), 16),
+                                                   frame_id, args.width, args.height)
+                    for x, y, w, h, label, conf, tid in boxes[:16]:
                         name = label.encode()[:15]
-                        blob += struct.pack("<hhHHBB", x, y, w, h,
-                                            int(conf * 100), len(name)) + name
+                        blob += struct.pack(DET_BOX, x, y, w, h,
+                                            int(conf * 100), tid, len(name)) + name
                     sock.sendto(blob, peer)
+                    if args.autopilot_port:
+                        auto_sock.sendto(blob, auto_addr)
 
                 now = time.monotonic()
                 if now - last_report >= 5.0:
                     span = now - last_report
-                    print(f"  {frames / span:5.1f} fps   "
-                          f"{total_bytes / span / 1024:6.1f} KB/s   "
-                          f"{total_bytes // max(frames, 1):5d} B/frame   "
-                          f"{dropped} stale dropped")
+                    line = (f"  {frames / span:5.1f} fps   "
+                            f"{total_bytes / span / 1024:6.1f} KB/s   "
+                            f"{total_bytes // max(frames, 1):5d} B/frame   "
+                            f"{dropped} stale dropped")
+                    if detector is not None:
+                        st = detector.stats()
+                        # inference fps against video fps is the number that
+                        # says whether the cloud is keeping up with the stream.
+                        # If dropped climbs, the pool is saturated: raise
+                        # --detect-workers or accept fewer detections.
+                        rate = (st["calls"] - last_calls) / span
+                        line += (f"\n    detect {rate:5.1f}/s  p50 {st['p50']:4.0f} ms  "
+                                 f"p90 {st['p90']:4.0f} ms  "
+                                 f"{st['dropped'] - last_drops} skipped  "
+                                 f"{st['failures']} failed  {len(boxes)} box")
+                        if st["failures"] and detector.last_error:
+                            line += f"\n    last error: {detector.last_error}"
+                        last_calls, last_drops = st["calls"], st["dropped"]
+                    print(line)
                     last_report, frames, total_bytes, dropped = now, 0, 0, 0
         except KeyboardInterrupt:
             print("\n  stopping")
         finally:
+            if recorder.active():
+                done = recorder.stop()
+                print(f"  recording closed: {done['frames']} frames -> "
+                      f"{done['path']}.mjpeg")
             sock.close()
     return 0
 
@@ -333,10 +466,21 @@ def main():
                     help="run the Roboflow workflow alongside the stream and send "
                          "boxes to the badge. Needs RF_API_KEY in the environment "
                          "and internet on this machine.")
-    ap.add_argument("--detect-interval", type=float, default=0.5,
-                    help="seconds between inference calls (default 0.5). A round "
-                         "trip is about half a second, so going below this just "
-                         "queues up.")
+    ap.add_argument("--detect-workers", type=int, default=8, metavar="N",
+                    help="how many inference requests to keep in flight (default 8). "
+                         "This, not the round trip, is what sets the detection rate: "
+                         "one at a time measured 3.6 fps and eight measured 36.6 "
+                         "against the same endpoint.")
+    ap.add_argument("--detect-interval", type=float, default=0.0,
+                    help="minimum seconds between inference calls (default 0, "
+                         "meaning every frame). Every call is billed, so raise "
+                         "this to trade detection rate for credits.")
+    ap.add_argument("--autopilot-host", default="127.0.0.1",
+                    help="where to send boxes for the chase controller")
+    ap.add_argument("--autopilot-port", type=int, default=14559,
+                    help="0 to not send boxes to the autopilot at all")
+    ap.add_argument("--record-dir", default=os.path.expanduser("~/recordings"),
+                    help="where B+UP on the badge writes takes")
     ap.add_argument("--list", action="store_true", help="list attached OAK devices and exit")
     ap.add_argument("--save", type=int, metavar="N",
                     help="write N frames to .jpg files and exit; no badge needed")

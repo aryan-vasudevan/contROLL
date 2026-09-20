@@ -11,7 +11,20 @@ Wants=network.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi
-ExecStart=/home/pi/oak/bin/python -u /home/pi/oak_stream.py
+# Cloud detection needs an API key and a flag, and the key must never be in
+# the repo -- so both come from a file that only exists on the Pi:
+#
+#     sudo tee /etc/default/oak-stream <<'EOF'
+#     RF_API_KEY=...
+#     OAK_ARGS=--detect
+#     EOF
+#     sudo systemctl restart oak-stream
+#
+# The leading "-" makes it optional: with no such file the stream runs exactly
+# as it always has, video only. Point RF_URL at a dedicated deployment there
+# too if there is one.
+EnvironmentFile=-/etc/default/oak-stream
+ExecStart=/home/pi/oak/bin/python -u /home/pi/oak_stream.py $OAK_ARGS
 
 # The OAK is on USB and can take a moment to be claimable after a reboot, and
 # the badge retries forever anyway, so restarting is always the right answer.

@@ -101,7 +101,13 @@
 // end flips both axes at once. Doing it on the camera would mean another ISP
 // pass and more latency. Set to 0 if the camera is ever mounted the right way
 // up.
-#define CAM_ROTATE_180    1
+// Off since the badgetest run on real hardware. The panel itself is now
+// mounted-orientation-correct via setRotation(3), so the software flip that
+// compensated for setRotation(1) is no longer needed -- and removing it also
+// removes a full-buffer pixel reversal from every decoded strip. If video
+// ever appears upside down again, fix it HERE or at setRotation, never both:
+// two 180s cancel and look like neither is working.
+#define CAM_ROTATE_180    0
 
 // Send rates. Fast while a button is held so a press lands promptly, slow when
 // idle so the Pi still has a liveness signal without pointless traffic.
@@ -187,17 +193,17 @@
 #define COME_CONFIRM_MS     1500
 
 // Ignore further shakes for this long after one fires.
-#define SHAKE_COOLDOWN_MS   4000
+#define SHAKE_COOLDOWN_MS   2000
 
 // === Shake detection ========================================================
 // A shake is counted when the accelerometer's gravity-removed magnitude swings
 // past this threshold, in g. Raise it if the drone gets called by walking.
-#define SHAKE_THRESHOLD_G   1.1f
+#define SHAKE_THRESHOLD_G   0.75f
 
 // Number of threshold crossings, and the window they must land in, for the
 // motion to count as a deliberate shake rather than a knock.
-#define SHAKE_CROSSINGS     4
-#define SHAKE_WINDOW_MS     1200
+#define SHAKE_CROSSINGS     3
+#define SHAKE_WINDOW_MS     900
 
 // === Optional fixed beacon ==================================================
 // Leave both at 0 to use the "mark my spot" gesture instead, which captures the
