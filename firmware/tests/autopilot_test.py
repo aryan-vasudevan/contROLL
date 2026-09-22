@@ -36,6 +36,9 @@ from oak_stream import (DET_BOX, DET_HEADER, DET_MAGIC,      # noqa: E402
 BTN_PORT, BOX_PORT = 34555, 34559
 WIDTH, HEIGHT = 160, 120
 TARGET_ID = 7
+# Ten seconds is the number for a person; 1.5 is the number for a test that
+# has to sit through the lapse to prove it happens.
+POWERUP_SECONDS = 1.5
 
 fails = []
 # "  UP    L +0.60  R +0.60  chase #7 pivot"
@@ -67,8 +70,13 @@ def box_at(centre_x, fill, tid=TARGET_ID):
 class Rig:
     """Keeps the badge heartbeat and the detection stream running."""
 
-    def __init__(self, proc):
+    def __init__(self, proc, btn_port=BTN_PORT, box_port=BOX_PORT, nfcseq=0):
+        # nfcseq is a constructor argument rather than something to assign
+        # afterwards: the pump starts here, and a single line sent with the
+        # wrong count is a tap the other end will believe.
         self.proc = proc
+        self.btn_port = btn_port
+        self.box_port = box_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
         self.held = ""
@@ -76,6 +84,8 @@ class Rig:
         self.auto = 0
         self.rec = 0
         self.honk = 0
+        self.nfcseq = nfcseq
+        self.nfcuid = "04A1B2C3D4E5F6"
         self.boxes = []
         self.running = True
         self.lines = []
@@ -88,14 +98,19 @@ class Rig:
             with self._lock:
                 held, sel, auto, boxes = self.held, self.sel, self.auto, self.boxes
                 rec, honk = self.rec, self.honk
+                nfcseq, nfcuid = self.nfcseq, self.nfcuid
                 self.honk = 0            # one-shot, exactly as the badge sends it
             if boxes:
-                self.sock.sendto(det_packet(boxes), ("127.0.0.1", BOX_PORT))
+                self.sock.sendto(det_packet(boxes), ("127.0.0.1", self.box_port))
             self.seq += 1
+            # nfc= reads "00" until the first tap, exactly as the badge sends it:
+            # the field is the same shape from boot so the Pi can adopt a
+            # baseline without the first real tap being swallowed as one.
             line = (f"BADGE1 seq={self.seq} ms={int(time.monotonic()*1000)} "
                     f"raw=0x00 down=[{held}] sel={sel} auto={auto} "
-                    f"shake=0 rec={rec} honk={honk}")
-            self.sock.sendto(line.encode(), ("127.0.0.1", BTN_PORT))
+                    f"shake=0 rec={rec} honk={honk} "
+                    f"nfc={nfcuid if nfcseq else '00'} nfcseq={nfcseq}")
+            self.sock.sendto(line.encode(), ("127.0.0.1", self.btn_port))
             time.sleep(0.02)                      # 50 Hz, as the badge does
 
     def _read(self):
@@ -119,6 +134,11 @@ class Rig:
                 self.rec = rec
             if honk is not None:
                 self.honk = honk
+
+    def tap(self):
+        """One presentation of a tag. The badge counts these, not polls."""
+        with self._lock:
+            self.nfcseq += 1
 
     def saw(self, needle):
         with self._lock:
@@ -149,11 +169,16 @@ class Rig:
         time.sleep(0.05)
 
 
-proc = subprocess.Popen(
-    [sys.executable, "-u", os.path.join(ROOT, "pi5", "badgedrive.py"),
-     "--dry-run", "--port", str(BTN_PORT), "--box-port", str(BOX_PORT)],
-    cwd=os.path.join(ROOT, "pi5"),
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def launch(btn_port=BTN_PORT, box_port=BOX_PORT):
+    return subprocess.Popen(
+        [sys.executable, "-u", os.path.join(ROOT, "pi5", "badgedrive.py"),
+         "--dry-run", "--port", str(btn_port), "--box-port", str(box_port),
+         "--powerup-seconds", str(POWERUP_SECONDS)],
+        cwd=os.path.join(ROOT, "pi5"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+proc = launch()
 
 try:
     time.sleep(0.6)
@@ -277,6 +302,34 @@ try:
     rig.set(held="")
 
     print()
+    print("=== tap a tag, the car speeds up ===")
+    rig.set(held="UP", sel=0, auto=0, boxes=[])
+    base, _, _ = rig.settle(0.4)
+    check(base > 0, f"driving normally at {base}")
+    check(not rig.saw("POWER UP"),
+          "a counter that has never moved is not a tap", rig)
+
+    rig.tap()
+    fast, _, _ = rig.settle(0.4)
+    check(fast > base, f"a tap speeds it up ({base} -> {fast})", rig)
+    check(rig.saw("POWER UP"), "and says so on the console", rig)
+
+    # Stacking is the failure that matters: a car walked up to a speed it will
+    # not steer at, one tap at a time, by somebody who thinks faster is better.
+    rig.tap()
+    rig.settle(0.2)
+    rig.tap()
+    again, _, _ = rig.settle(0.2)
+    check(abs(again - fast) < 1e-6,
+          f"tapping again restarts the clock rather than stacking ({again})", rig)
+
+    time.sleep(POWERUP_SECONDS + 0.3)
+    lapsed, _, _ = rig.settle(0.3)
+    check(abs(lapsed - base) < 1e-6,
+          f"and it lapses back to normal on its own ({lapsed})", rig)
+    rig.set(held="")
+
+    print()
     print("=== the badge goes silent mid-chase ===")
     rig.set(held="", sel=TARGET_ID, auto=1, boxes=[box_at(WIDTH / 2, 0.15)])
     left, right, _ = rig.settle()
@@ -286,6 +339,33 @@ try:
     with rig._lock:
         tail = [x for x in rig.lines if "stop" in x]
     check(bool(tail), "silence stops the car even though it was driving itself")
+
+    print()
+    print("=== restarting this script is not a tap ===")
+    # The badge keeps counting across a restart of this end. If the first
+    # value seen were acted on rather than adopted, every restart within
+    # range of a badge that had ever been tapped would hand out a free
+    # power-up -- and restarts happen with somebody standing over the car.
+    proc2 = launch(BTN_PORT + 1, BOX_PORT + 1)
+    try:
+        time.sleep(0.6)
+        rig2 = Rig(proc2, BTN_PORT + 1, BOX_PORT + 1, nfcseq=12)
+        rig2.set(held="UP")
+        cold, _, _ = rig2.settle(0.6)
+        check(not rig2.saw("POWER UP"),
+              "a counter already at 12 on the first packet is adopted, not acted on",
+              rig2)
+        rig2.tap()
+        warm, _, _ = rig2.settle(0.4)
+        check(warm > cold,
+              f"but the next change to it is a real tap ({cold} -> {warm})", rig2)
+        rig2.stop()
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
 
 finally:
     proc.terminate()

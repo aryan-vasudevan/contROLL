@@ -124,6 +124,8 @@ NFCUID = re.compile(r"\bnfc=([0-9A-Fa-f]+)\b")
 # Tapping the tag adds POWERUP_STEP to the normal speed for POWERUP_SECONDS,
 # then it lapses on its own. Tapping again restarts the clock rather than
 # stacking, so the car cannot be walked up to a speed it will not steer at.
+# Both are --powerup-step/--powerup-seconds, because a lapse nobody can afford
+# to sit through in a test is a lapse nobody tests.
 #
 # It moves the *base* only: A still boosts and B still crawls, because those
 # are the two speeds you reach for when something is about to go wrong.
@@ -211,6 +213,11 @@ def main() -> int:
     ap.add_argument("--chase-speed", type=float, default=ChaseConfig().max_speed,
                     help="ceiling on autonomous speed. Lower is the right "
                          "instinct: detections are a few hundred ms old.")
+    ap.add_argument("--powerup-step", type=float, default=POWERUP_STEP,
+                    help="how much a tag tap adds to the base speed")
+    ap.add_argument("--powerup-seconds", type=float, default=POWERUP_SECONDS,
+                    help="how long a tap lasts. The tests turn this right "
+                         "down; ten seconds is the number for a person.")
     args = ap.parse_args()
 
     cfg = ChaseConfig(max_speed=args.chase_speed)
@@ -250,7 +257,8 @@ def main() -> int:
 
     def drive_speed() -> float:
         """Normal speed, plus the power-up while it lasts."""
-        return args.speed + (POWERUP_STEP if time.monotonic() < boost_until else 0.0)
+        boosted = time.monotonic() < boost_until
+        return args.speed + (args.powerup_step if boosted else 0.0)
 
     boxes: dict = {}
     boxes_at = 0.0
@@ -344,10 +352,10 @@ def main() -> int:
                             nfc_last = seq_i
                         elif seq_i != nfc_last:
                             nfc_last = seq_i
-                            boost_until = time.monotonic() + POWERUP_SECONDS
+                            boost_until = time.monotonic() + args.powerup_seconds
                             uid_m = NFCUID.search(text)
-                            print(f"  *** POWER UP!  +{POWERUP_STEP:.2f} for "
-                                  f"{POWERUP_SECONDS:.0f}s  "
+                            print(f"  *** POWER UP!  +{args.powerup_step:.2f} for "
+                                  f"{args.powerup_seconds:.0f}s  "
                                   f"({uid_m.group(1) if uid_m else '?'}) ***")
 
                     sel_m, auto_m = SEL.search(text), AUTO.search(text)
