@@ -198,7 +198,7 @@
 // === Shake detection ========================================================
 // A shake is counted when the accelerometer's gravity-removed magnitude swings
 // past this threshold, in g. Raise it if the drone gets called by walking.
-#define SHAKE_THRESHOLD_G   0.75f
+#define SHAKE_THRESHOLD_G   0.6f
 
 // Number of threshold crossings, and the window they must land in, for the
 // motion to count as a deliberate shake rather than a knock.

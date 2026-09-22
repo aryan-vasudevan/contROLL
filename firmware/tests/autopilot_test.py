@@ -247,7 +247,7 @@ try:
     rig.set(held="", sel=0, auto=0, honk=1)
     rig.settle(0.4)
     check(rig.saw("honk"), "honk=1 is acknowledged", rig)
-    check(rig.saw("no speaker"), "and without a speaker it is SILENT, not motors", rig)
+    check(rig.saw("motor horn"), "without a speaker the motor horn plays again", rig)
     left, right, _ = rig.settle(0.3)
     check(left == 0.0 and right == 0.0, "and the car does not move")
 

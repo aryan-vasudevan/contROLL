@@ -515,7 +515,9 @@ void pollSelection() {
   if (bNow && (anyDir || btn::down(btn::A))) bDirty = true; // crawl or chord
   if (!aNow && wasABare && !aDirty && millis() - aDownAt < 500)
     gRecording = !gRecording;
-  if (!bNow && wasBBare && !bDirty && millis() - bDownAt < 500)
+  // Honk on the PRESS edge -- instant, no release-wait. The cost: starting
+  // a B-chord or a crawl also honks once. Accepted; the horn is the point.
+  if (bNow && !wasBBare)
     gHonk = true;
   wasABare = aNow; wasBBare = bNow;
 

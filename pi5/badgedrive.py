@@ -333,13 +333,13 @@ def main() -> int:
                     # spin wins -- the horn IS the motors, and both at once
                     # would fight over the same coils.
                     if not shaken and honk_m and honk_m.group(1) == "1":
-                        # Speaker or silence. The motor horn is retired at the
-                        # user's request (a buzzer may take its place); until a
-                        # USB speaker is attached, honking quietly does nothing
-                        # rather than doing something embarrassing.
+                        # Speaker first; the motor horn is back as the loud
+                        # fallback until real audio hardware exists.
                         played = speaker.play_random()
+                        if played is None and horn.play("honk"):
+                            played = "motor horn"
                         if not args.quiet:
-                            print(f"  honk ({played or 'no speaker; silent'})")
+                            print(f"  honk ({played or 'nothing to play'})")
 
                     # rec= is level, not an edge, so a lost packet cannot leave
                     # the two ends disagreeing about whether tape is rolling.

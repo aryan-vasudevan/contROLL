@@ -44,7 +44,7 @@ except ImportError:
 # Duty cycle while playing. 0.08 was inaudible over a hackathon floor; 0.15
 # is properly loud and still under the ~0.25 where these gearboxes start to
 # creep. If the car twitches while honking, this is the number to lower.
-TONE_DUTY = 0.15
+TONE_DUTY = 0.28
 
 # (hertz, milliseconds). 0 Hz is a rest.
 #
