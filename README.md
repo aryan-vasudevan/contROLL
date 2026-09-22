@@ -8,7 +8,7 @@ and stops on its own.
 ```
    badge (ESP32-C3)                      Raspberry Pi 5 (on the car)
  ┌────────────────────┐            ┌──────────────────────────────────┐
- │ buttons ───────────┼──UDP 14555─▶ badgedrive.py ──GPIO──▶ L298N ──▶ motors
+ │ buttons + NFC ─────┼──UDP 14555─▶ badgedrive.py ──GPIO──▶ L298N ──▶ motors
  │                    │            │      ▲                           │
  │ 320x240 screen ◀───┼──UDP 14557─┤ oak_stream.py ◀──USB─── OAK-1    │
  │   live video       │            │      │                           │
@@ -31,6 +31,7 @@ uplink by itself, from boot.
 | A (held with a direction) | boost |
 | B (held with a direction) | crawl, for lining something up |
 | HOME held | stop, latched until everything is released |
+| tap an NFC tag | power-up: +0.05 on the base speed for ten seconds |
 | silence | the failsafe: 200 ms without a badge packet cuts the motors |
 
 ## The vision loop
@@ -52,6 +53,42 @@ people rather than trailing them by the network round trip.
 The chase commits: it survives detector dropouts and identity churn,
 re-locks onto the chosen person, seeks briefly if blinded, and only then
 gives up. The LED ring runs a spinning Solana-palette snake.
+
+## Tap to power up
+
+The badge's MFRC522 is populated on the board and, until now, ran no code at
+all. `firmware/src/nfc.cpp` drives it over the I2C bus the accelerometer
+already uses: REQA, then anticollision through as many cascade levels as the
+UID needs, which is everything required to answer *which tag is this*. No
+authentication and no memory reads — the UID identifies a sticker, and every
+extra command is another thing to get wrong in a loop that is also decoding
+JPEG.
+
+A tap throws `POWER UP!` across the video, flashes the LED ring, and rides
+out to the Pi as `nfc=`/`nfcseq=` appended to the button line already being
+sent. The Pi reads a change in that counter as one tap and adds 0.05 to the
+base speed for ten seconds. It moves the *base* only, so A still boosts and
+B still crawls: those are the two speeds you reach for when something is
+about to go wrong. Tapping again restarts the clock rather than stacking, so
+the car cannot be walked up to a speed it will not steer at.
+
+Three things were worth getting right, and all three are in the tests:
+
+- **A tap is an arrival, not a presence.** Holding the badge against a
+  sticker reads it every poll; only the first counts, and the same tag has
+  to leave the field for 1.5 s before it can count again.
+- **A restart is not a tap.** The badge keeps counting across a restart of
+  the Pi script, so the first counter value seen is adopted rather than
+  acted on.
+- **The reader is at `0x26`**, not the `0x29` its strapping resistors
+  predict — the straps were read correctly, but turning them into an address
+  needs pin-function names and the schematic symbol is an EasyEDA conversion
+  that lacks them. `begin()` sweeps `0x20`–`0x2F` and believes whatever
+  answers. It also accepts version bytes outside NXP's documented
+  `0x91`/`0x92`, because the part on this badge reports `0x82`.
+
+**The driver has never seen a real tag.** The Pi half is tested end to end;
+the badge half compiles and is unproven.
 
 ## Getting started
 
@@ -87,7 +124,13 @@ Pi's real packer produced), the tracker's identity-keeping across stalls and
 out-of-order replies, the chase controller's symmetry and stop conditions,
 the shake detector against walking and knocking, and the whole autopilot
 end-to-end over real sockets — including that a hand on the controls always
-outranks it and that silence always stops the car.
+outranks it, that silence always stops the car, and that a tag tap boosts it
+exactly once and then lapses.
+
+Each power-up check was confirmed to fail against a deliberately broken
+build before being kept. The one bug in this project's history that cost the
+most was a test that re-derived a fact the same way the code did and so
+proved only that the code agreed with itself.
 
 ## History
 
