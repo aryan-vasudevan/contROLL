@@ -28,6 +28,7 @@
 #include <WiFiUdp.h>
 #include <esp_system.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <string.h>
 
 #include <SPI.h>
@@ -40,6 +41,7 @@
 #include "buttons.h"
 #include "imu.h"
 #include "leds.h"
+#include "nfc.h"
 
 namespace {
 
@@ -379,6 +381,65 @@ bool pumpVideo() {
 // The selected target is drawn differently rather than merely labelled: at
 // 320x240 with several people in frame, a colour change is readable at arm's
 // length and a small "*" is not.
+// --- NFC ------------------------------------------------------------------
+// gNfcSeq counts presentations, not polls: it rises once when a tag arrives
+// and not again until that tag has been away for kNfcGapMs.
+char     gNfcUid[2 * nfc::kMaxUid + 1] = {0};
+uint32_t gNfcSeq        = 0;
+uint32_t gNfcLastSeen   = 0;
+uint32_t gLastNfcPollMs = 0;
+constexpr uint32_t kNfcPollMs = 100;
+constexpr uint32_t kNfcGapMs  = 1500;
+
+uint32_t gBannerUntilMs = 0;
+constexpr uint32_t kBannerMs = 1500;
+constexpr char kBannerText[] = "POWER UP!";
+
+// Built-in 6x8 font, so at size 3 a character is 18x24.
+void drawBanner() {
+  if (millis() > gBannerUntilMs) return;
+  const int tw = (int)(sizeof(kBannerText) - 1) * 18;
+  const int th = 24;
+  const int x = (gTft.width() - tw) / 2;
+  const int y = (gTft.height() - th) / 2;
+  gTft.fillRect(x - 8, y - 8, tw + 16, th + 16, ST77XX_BLACK);
+  gTft.drawRect(x - 8, y - 8, tw + 16, th + 16, ST77XX_YELLOW);
+  gTft.drawRect(x - 7, y - 7, tw + 14, th + 14, ST77XX_YELLOW);
+  gTft.setTextSize(3);
+  gTft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  gTft.setCursor(x, y);
+  gTft.print(kBannerText);
+  gTft.setTextSize(1);
+}
+
+// Turns "a tag is in the field" into "a tag arrived".
+void serviceNfc() {
+  if (!nfc::present()) return;
+  if (millis() - gLastNfcPollMs < kNfcPollMs) return;
+  gLastNfcPollMs = millis();
+
+  nfc::Tag tag;
+  if (!nfc::poll(tag)) return;
+
+  char uid[sizeof(gNfcUid)];
+  nfc::formatUid(tag, uid, sizeof(uid));
+
+  // Holding the badge against the tag reads it every poll; only the first of
+  // those is a tap.
+  if (strcmp(uid, gNfcUid) == 0 && millis() - gNfcLastSeen < kNfcGapMs) {
+    gNfcLastSeen = millis();
+    return;
+  }
+  strncpy(gNfcUid, uid, sizeof(gNfcUid) - 1);
+  gNfcUid[sizeof(gNfcUid) - 1] = '\0';
+  gNfcLastSeen = millis();
+  gNfcSeq++;
+  gBannerUntilMs = millis() + kBannerMs;
+  leds::flash(leds::Status::ComeActive, kBannerMs);
+  Serial.printf("[cam] NFC %s  (tap %lu)  POWER UP\n",
+                gNfcUid, (unsigned long)gNfcSeq);
+}
+
 void drawBoxes() {
   if (gBoxCount == 0 || millis() - gBoxesAtMs > kBoxStaleMs) return;
   for (int i = 0; i < gBoxCount; i++) {
@@ -594,6 +655,7 @@ bool decodeFrame() {
   gJpeg.close();
 
   drawBoxes();
+  drawBanner();
   drawHud();
 
   gFrames++;
@@ -619,17 +681,26 @@ void sendButtons() {
     if (held[0]) strncat(held, " ", sizeof(held) - strlen(held) - 1);
     strncat(held, btn::name(b), sizeof(held) - strlen(held) - 1);
   }
-  char line[192];
+  // nfc=/nfcseq= ride along after the other appended fields. A Pi whose regex
+  // stops at down=[...] is unaffected. "00" before the first tap keeps the
+  // field shaped the same from boot, so the Pi can adopt a baseline and the
+  // first real tap is not swallowed as one.
+  char nfcTail[48];
+  snprintf(nfcTail, sizeof(nfcTail), " nfc=%s nfcseq=%lu",
+           gNfcSeq ? gNfcUid : "00", (unsigned long)gNfcSeq);
+
+  char line[256];
   // sel/auto are appended after down=[...] rather than inserted, so a Pi
   // running the older badge_listen.py -- whose regex stops at the closing
   // bracket -- keeps working untouched.
   const int n = snprintf(line, sizeof(line),
                          "BADGE1 seq=%lu ms=%lu raw=0x%02X down=[%s] sel=%u auto=%d "
-                         "shake=%d rec=%d honk=%d",
+                         "shake=%d rec=%d honk=%d%s",
                          (unsigned long)++gSeq, (unsigned long)millis(),
                          btn::rawRegister(), held,
                          (unsigned)gSelected, gAuto ? 1 : 0,
-                         gShake ? 1 : 0, gRecording ? 1 : 0, gHonk ? 1 : 0);
+                         gShake ? 1 : 0, gRecording ? 1 : 0, gHonk ? 1 : 0,
+                         nfcTail);
   // One-shot events, cleared the moment they are on the wire. Level state
   // (rec) is not cleared: the Pi should be able to recover it from any packet,
   // not just the one where it changed.
@@ -673,6 +744,16 @@ void setup() {
                   imu::whoAmI());
   } else {
     Serial.println("[cam] no accelerometer; shake-to-honk disabled");
+  }
+
+  // Same bus as the accelerometer, which has already called Wire.begin().
+  // Calling it again is harmless and covers a badge with no accelerometer.
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+  if (nfc::begin()) {
+    Serial.printf("[cam] NFC reader at 0x%02X, version 0x%02X\n",
+                  nfc::address(), nfc::version());
+  } else {
+    Serial.println("[cam] no NFC reader answered 0x20-0x2F; tap disabled");
   }
 
   // Panel first, before anything that can fail for network reasons.
@@ -723,6 +804,7 @@ void loop() {
   btn::poll();
   leds::poll();
   imu::poll();
+  serviceNfc();
   pollSelection();
 
   if (WiFi.status() != WL_CONNECTED) {

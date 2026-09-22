@@ -117,6 +117,18 @@ AUTO = re.compile(r"\bauto=(\d+)\b")
 REC = re.compile(r"\brec=(\d+)\b")
 HONK = re.compile(r"\bhonk=(\d+)\b")
 SHAKE = re.compile(r"\bshake=(\d+)\b")
+NFCSEQ = re.compile(r"\bnfcseq=(\d+)\b")
+NFCUID = re.compile(r"\bnfc=([0-9A-Fa-f]+)\b")
+
+# --- power-up ---------------------------------------------------------------
+# Tapping the tag adds POWERUP_STEP to the normal speed for POWERUP_SECONDS,
+# then it lapses on its own. Tapping again restarts the clock rather than
+# stacking, so the car cannot be walked up to a speed it will not steer at.
+#
+# It moves the *base* only: A still boosts and B still crawls, because those
+# are the two speeds you reach for when something is about to go wrong.
+POWERUP_STEP = 0.05
+POWERUP_SECONDS = 10.0
 
 # Shake the badge, the car spins. Aggressive on purpose -- it is a party
 # trick, and a hesitant party trick is worse than none. Manual input or the
@@ -233,6 +245,12 @@ def main() -> int:
     moving = False
     packets = 0
     last_seen = 0.0
+    nfc_last: int | None = None   # None until the badge's counter is adopted
+    boost_until = 0.0
+
+    def drive_speed() -> float:
+        """Normal speed, plus the power-up while it lasts."""
+        return args.speed + (POWERUP_STEP if time.monotonic() < boost_until else 0.0)
 
     boxes: dict = {}
     boxes_at = 0.0
@@ -315,6 +333,23 @@ def main() -> int:
                     held = set(match.group(4).split())
                     sock.sendto(b"OK", peer)   # the badge's LEDs key off this
 
+                    # A change in the badge's tap counter is one tap. The
+                    # first value seen is adopted, not acted on: the badge
+                    # keeps counting across a restart of this script, and a
+                    # restart is not a tap.
+                    seq_m = NFCSEQ.search(text)
+                    if seq_m:
+                        seq_i = int(seq_m.group(1))
+                        if nfc_last is None:
+                            nfc_last = seq_i
+                        elif seq_i != nfc_last:
+                            nfc_last = seq_i
+                            boost_until = time.monotonic() + POWERUP_SECONDS
+                            uid_m = NFCUID.search(text)
+                            print(f"  *** POWER UP!  +{POWERUP_STEP:.2f} for "
+                                  f"{POWERUP_SECONDS:.0f}s  "
+                                  f"({uid_m.group(1) if uid_m else '?'}) ***")
+
                     sel_m, auto_m = SEL.search(text), AUTO.search(text)
                     selected = int(sel_m.group(1)) if sel_m else 0
                     autonomous = bool(auto_m and auto_m.group(1) == "1")
@@ -383,7 +418,7 @@ def main() -> int:
                 # A hand on the controls outranks the autopilot, always, and
                 # the check is here as well as on the badge because the badge
                 # can be switched off and this cannot.
-                left, right = wheels(held, args.speed)
+                left, right = wheels(held, drive_speed())
             elif autonomous and selected:
                 if locked_id == 0:
                     locked_id = selected
@@ -418,7 +453,7 @@ def main() -> int:
                     left, right = 0.0, 0.0
                     status = "lost"
             else:
-                left, right = wheels(held, args.speed)
+                left, right = wheels(held, drive_speed())
 
             if (left, right) != last_drive or status != last_status:
                 if horn.active() and (left, right) != (0.0, 0.0):
